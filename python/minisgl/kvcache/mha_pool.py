@@ -75,6 +75,10 @@ class MHAKVCache(BaseKVCachePool):
     def bytes_per_page(self) -> int:
         return self._kv_buffer[:, :, 0].numel() * self._kv_buffer.element_size()
 
+    @property
+    def page_shape(self) -> tuple[int, ...]:
+        return tuple(self._kv_buffer.shape[3:])
+
     def copy_pages_to(
         self,
         destination: torch.Tensor,

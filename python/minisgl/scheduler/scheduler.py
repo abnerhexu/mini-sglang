@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, NoReturn, Set, Tuple, 
 import torch
 from minisgl.agentweave import EventLogger, LifecycleRegistry, ToolLifecycleEvent
 from minisgl.agentweave.kv import (
+    HostKVPagePool,
+    HostKVTransferController,
     KVAction,
     KVCacheDescriptor,
     KVPressure,
@@ -80,6 +82,22 @@ class Scheduler(SchedulerIOMixin):
         self.agent_cache_tokens: Dict[str, torch.Tensor] = {}
         self.agent_cache_locks: Set[str] = set()
         self.agent_kv_started: Set[str] = set()
+        self.agent_host_pool: HostKVPagePool | None = None
+        self.agent_kv_transfer: HostKVTransferController | None = None
+        if config.agentweave_host_kv_pages > 0:
+            kv_cache = self.engine.kv_cache
+            self.agent_host_pool = HostKVPagePool(
+                config.agentweave_host_kv_pages,
+                num_layers=kv_cache.num_layers,
+                page_shape=kv_cache.page_shape,
+                dtype=kv_cache.dtype,
+            )
+            self.agent_kv_transfer = HostKVTransferController(
+                self.cache_manager,
+                kv_cache,
+                self.agent_host_pool,
+                page_size=config.page_size,
+            )
         self.agent_events = EventLogger(
             config.agentweave_event_log if config.tp_info.is_primary() else None,
             component="scheduler",
@@ -155,6 +173,11 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        lifecycle_ids = set(self.agent_cache_handles) | set(self.agent_cache_tokens)
+        if self.agent_kv_transfer is not None:
+            lifecycle_ids.update(self.agent_kv_transfer.entries)
+        for lifecycle_id in lifecycle_ids:
+            self._release_agent_kv_resources(lifecycle_id)
         self.agent_events.close()
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
@@ -234,6 +257,9 @@ class Scheduler(SchedulerIOMixin):
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
             if msg.agent_metadata is not None:
+                metadata = msg.agent_metadata
+                if metadata.is_continuation and metadata.parent_lifecycle_id is not None:
+                    self._prepare_agent_continuation(metadata.parent_lifecycle_id)
                 record, created = self.agent_lifecycles.request_received(
                     msg.uid, msg.agent_metadata
                 )
@@ -268,17 +294,10 @@ class Scheduler(SchedulerIOMixin):
             elif created and msg.event.event == "abort":
                 action = self.agent_kv_policy.on_abort(record.lifecycle_id)
                 self._apply_agent_kv_action(action)
-            elif created and msg.event.event in (
-                "continuation_submitted",
-                "generation_released",
-            ):
-                if record.lifecycle_id in self.agent_cache_locks:
-                    action = self.agent_kv_policy.on_tool_finished(record.lifecycle_id)
-                    self._apply_agent_kv_action(action)
-                else:
-                    self.agent_cache_handles.pop(record.lifecycle_id, None)
-                    self.agent_cache_tokens.pop(record.lifecycle_id, None)
-                    self.agent_kv_started.discard(record.lifecycle_id)
+            elif created and msg.event.event == "continuation_submitted":
+                self._prepare_agent_continuation(record.lifecycle_id)
+            elif created and msg.event.event == "generation_released":
+                self._release_agent_kv_resources(record.lifecycle_id)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
@@ -363,7 +382,9 @@ class Scheduler(SchedulerIOMixin):
             gpu_usage=min(1.0, max(0.0, gpu_usage)),
             free_pages=free_pages,
             waiting_pages=waiting_pages,
-            host_free_pages=0,
+            host_free_pages=(
+                self.agent_host_pool.free_pages if self.agent_host_pool is not None else 0
+            ),
         )
 
     def _process_kv_policy_tick(self) -> None:
@@ -374,19 +395,51 @@ class Scheduler(SchedulerIOMixin):
         lifecycle_id = action.lifecycle_id
         handle = self.agent_cache_handles.get(lifecycle_id)
         implemented = action.action in ("none", "retain", "release")
+        transfer_detail = {}
         if action.action == "retain" and handle is not None:
             if lifecycle_id not in self.agent_cache_locks:
                 self.cache_manager.lock(handle)
                 self.agent_cache_locks.add(lifecycle_id)
         elif action.action == "release":
-            if lifecycle_id in self.agent_cache_locks and handle is not None:
-                self.cache_manager.unlock(handle)
-                self.agent_cache_locks.remove(lifecycle_id)
-            self.agent_cache_handles.pop(lifecycle_id, None)
-            self.agent_cache_tokens.pop(lifecycle_id, None)
-            self.agent_kv_started.discard(lifecycle_id)
-        elif action.action in ("offload", "prefetch"):
-            implemented = False
+            self._release_agent_kv_resources(lifecycle_id)
+        elif action.action == "offload":
+            tokens = self.agent_cache_tokens.get(lifecycle_id)
+            if self.agent_kv_transfer is not None and handle is not None and tokens is not None:
+                try:
+                    result = self.agent_kv_transfer.offload(lifecycle_id, tokens, handle)
+                except Exception as exc:
+                    logger.exception("AgentWeave KV offload failed for %s", lifecycle_id)
+                    transfer_detail = {"transfer_error": str(exc)}
+                    implemented = False
+                else:
+                    transfer_detail = {
+                        "copied_pages": result.copied_pages,
+                        "reclaimed_pages": result.reclaimed_pages,
+                        "evicted_host_entries": len(result.evicted_host_keys),
+                    }
+                    self.agent_cache_handles.pop(lifecycle_id, None)
+                    self.agent_cache_tokens.pop(lifecycle_id, None)
+                    implemented = True
+            else:
+                implemented = False
+        elif action.action == "prefetch":
+            if self.agent_kv_transfer is not None:
+                try:
+                    result = self.agent_kv_transfer.prefetch(lifecycle_id)
+                except Exception as exc:
+                    logger.exception("AgentWeave KV prefetch failed for %s", lifecycle_id)
+                    transfer_detail = {"transfer_error": str(exc)}
+                    implemented = False
+                else:
+                    self.agent_cache_handles[lifecycle_id] = result.handle
+                    self.agent_cache_locks.add(lifecycle_id)
+                    transfer_detail = {
+                        "restored_pages": result.restored_pages,
+                        "restored_cached_len": result.cached_len,
+                    }
+                    implemented = True
+            else:
+                implemented = False
 
         record = self.agent_lifecycles.records.get(lifecycle_id)
         self.agent_events.emit(
@@ -400,7 +453,37 @@ class Scheduler(SchedulerIOMixin):
             execute_at=action.execute_at,
             estimated_duration_s=action.estimated_duration_s,
             implemented=implemented,
+            **transfer_detail,
         )
+
+    def _prepare_agent_continuation(self, lifecycle_id: str) -> None:
+        completion_action = self.agent_kv_policy.on_tool_finished(lifecycle_id)
+        if completion_action.action != "none":
+            self._apply_agent_kv_action(completion_action)
+        transfer = self.agent_kv_transfer
+        if transfer is not None and lifecycle_id in transfer.entries:
+            if lifecycle_id not in transfer.gpu_handles:
+                self._apply_agent_kv_action(
+                    KVAction("prefetch", lifecycle_id, "continuation_demand_restore")
+                )
+            if lifecycle_id not in transfer.gpu_handles:
+                return
+        self._release_agent_kv_resources(lifecycle_id)
+
+    def _release_agent_kv_resources(self, lifecycle_id: str) -> None:
+        tier_locked = (
+            self.agent_kv_transfer is not None
+            and lifecycle_id in self.agent_kv_transfer.gpu_handles
+        )
+        if self.agent_kv_transfer is not None:
+            self.agent_kv_transfer.release(lifecycle_id)
+        handle = self.agent_cache_handles.pop(lifecycle_id, None)
+        if lifecycle_id in self.agent_cache_locks:
+            if not tier_locked and handle is not None:
+                self.cache_manager.unlock(handle)
+            self.agent_cache_locks.discard(lifecycle_id)
+        self.agent_cache_tokens.pop(lifecycle_id, None)
+        self.agent_kv_started.discard(lifecycle_id)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

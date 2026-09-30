@@ -82,6 +82,31 @@ class HostKVPagePool:
     def contains(self, key: Hashable) -> bool:
         return key in self.entries
 
+    def reserve(
+        self,
+        key: Hashable,
+        num_pages: int,
+        *,
+        pin: bool = False,
+    ) -> tuple[tuple[int, ...], tuple[Hashable, ...]]:
+        if num_pages < 0:
+            raise ValueError("num_pages must be non-negative")
+        if num_pages > self.capacity_pages:
+            raise HostKVCapacityError(
+                f"entry needs {num_pages} pages, host pool capacity is {self.capacity_pages}"
+            )
+        if key in self.entries:
+            self.remove(key, force=True)
+        evicted = self._ensure_available(num_pages)
+        slots = tuple(self._free_slots.popleft() for _ in range(num_pages))
+        self.entries[key] = HostKVEntry(
+            key,
+            slots,
+            self.clock(),
+            pin_count=1 if pin else 0,
+        )
+        return slots, tuple(evicted)
+
     def store(
         self,
         key: Hashable,
@@ -94,28 +119,18 @@ class HostKVPagePool:
         pages = tuple(int(page) for page in source_pages)
         if any(page < 0 or page >= source.shape[2] for page in pages):
             raise IndexError("source page index is out of range")
-        if len(pages) > self.capacity_pages:
-            raise HostKVCapacityError(
-                f"entry needs {len(pages)} pages, host pool capacity is {self.capacity_pages}"
-            )
-        if key in self.entries:
+        slots, evicted = self.reserve(key, len(pages), pin=pin)
+        try:
+            if pages:
+                source_index = torch.tensor(pages, dtype=torch.long, device=source.device)
+                host_index = torch.tensor(slots, dtype=torch.long)
+                selected = source.index_select(2, source_index).to("cpu")
+                self.buffer.index_copy_(2, host_index, selected)
+                self.bytes_stored += len(pages) * self.bytes_per_page
+        except Exception:
             self.remove(key, force=True)
-
-        evicted = self._ensure_available(len(pages))
-        slots = tuple(self._free_slots.popleft() for _ in pages)
-        if pages:
-            source_index = torch.tensor(pages, dtype=torch.long, device=source.device)
-            host_index = torch.tensor(slots, dtype=torch.long)
-            selected = source.index_select(2, source_index).to("cpu")
-            self.buffer.index_copy_(2, host_index, selected)
-            self.bytes_stored += len(pages) * self.bytes_per_page
-        self.entries[key] = HostKVEntry(
-            key,
-            slots,
-            self.clock(),
-            pin_count=1 if pin else 0,
-        )
-        return tuple(evicted)
+            raise
+        return evicted
 
     def load(
         self,

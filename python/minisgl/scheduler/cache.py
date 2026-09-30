@@ -82,6 +82,22 @@ class CacheManager:
             self.lock(new_handle)
         return new_handle
 
+    def allocate_page_starts(self, num_pages: int) -> torch.Tensor:
+        return self._allocate(num_pages)
+
+    def free_page_starts(self, page_starts: torch.Tensor) -> None:
+        if len(page_starts) > 0:
+            self.free_slots = torch.cat([self.free_slots, page_starts])
+
+    def expand_page_starts(self, page_starts: torch.Tensor) -> torch.Tensor:
+        return self._page_to_token(page_starts)
+
+    def insert_prefix(
+        self, input_ids: torch.Tensor, indices: torch.Tensor
+    ) -> Tuple[int, BaseCacheHandle]:
+        result = self.prefix_cache.insert_prefix(input_ids, indices)
+        return result.cached_len, result.handle
+
     def evict_handle(self, handle: BaseCacheHandle) -> torch.Tensor:
         evicted = self.prefix_cache.evict_handle(handle)
         if len(evicted) > 0:

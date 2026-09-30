@@ -229,9 +229,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         choices=["no-control", "tokencake", "continuum"],
         default=ServerArgs.agentweave_kv_policy,
         help=(
-            "Tool-aware KV policy. TokenCake decisions are available for instrumentation; "
-            "GPU/CPU transfer execution requires the host-tier integration."
+            "Tool-aware KV policy. TokenCake transfer execution is enabled when "
+            "--agentweave-host-kv-pages is non-zero."
         ),
+    )
+    parser.add_argument(
+        "--agentweave-host-kv-pages",
+        type=int,
+        default=ServerArgs.agentweave_host_kv_pages,
+        help="Number of pinned CPU KV pages reserved for AgentWeave offload.",
     )
     parser.add_argument(
         "--enable-agentweave-runtime",
@@ -286,6 +292,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     run_shell |= kwargs.pop("shell_mode")
     if kwargs["agentweave_pool_size"] < 0 or kwargs["agentweave_pool_per_key"] < 0:
         parser.error("AgentWeave pool limits must be non-negative")
+    if kwargs["agentweave_host_kv_pages"] < 0:
+        parser.error("--agentweave-host-kv-pages must be non-negative")
     if kwargs["agentweave_pool_ttl_s"] < 0:
         parser.error("--agentweave-pool-ttl-s must be non-negative")
     if not 0 <= kwargs["agentweave_prewarm_threshold"] <= 1:

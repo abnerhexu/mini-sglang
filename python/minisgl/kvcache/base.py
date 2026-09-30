@@ -44,6 +44,10 @@ class BaseKVCachePool(ABC):
     @abstractmethod
     def bytes_per_page(self) -> int: ...
 
+    @property
+    @abstractmethod
+    def page_shape(self) -> tuple[int, ...]: ...
+
     @abstractmethod
     def copy_pages_to(
         self,

@@ -18,6 +18,7 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     agentweave_event_log: str | None = None
     agentweave_kv_policy: str = "no-control"
+    agentweave_host_kv_pages: int = 0
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
