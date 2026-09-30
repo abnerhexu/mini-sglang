@@ -85,6 +85,7 @@ class LifecycleEventRequest(BaseModel):
     event: Literal[
         "tool_predicted",
         "tool_started",
+        "sandbox_acquired",
         "tool_finished",
         "continuation_submitted",
         "generation_released",

@@ -15,6 +15,7 @@ from minisgl.agentweave.kv import (
     NoControlPolicy,
     OffloadResult,
     PrefetchResult,
+    TransferCostModel,
 )
 from minisgl.kvcache import BaseCacheHandle, MatchResult
 from minisgl.scheduler.scheduler import Scheduler
@@ -75,6 +76,7 @@ def _scheduler(policy, policy_name: str, handle: FakeHandle) -> Scheduler:
     scheduler.agent_lifecycles = LifecycleRegistry()
     scheduler.agent_kv_policy_name = policy_name
     scheduler.agent_kv_policy = policy
+    scheduler.agent_transfer_cost = TransferCostModel()
     scheduler.agent_cache_handles = {}
     scheduler.agent_cache_tokens = {}
     scheduler.agent_cache_locks = set()

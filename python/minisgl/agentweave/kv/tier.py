@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Hashable
 
@@ -30,6 +31,7 @@ class OffloadResult:
     copied_pages: int
     reclaimed_pages: int
     evicted_host_keys: tuple[Hashable, ...]
+    transfer_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class PrefetchResult:
     restored_pages: int
     cached_len: int
     handle: BaseCacheHandle
+    transfer_s: float = 0.0
 
 
 class HostKVTransferController:
@@ -78,6 +81,7 @@ class HostKVTransferController:
         self._remove_evicted_metadata(evicted)
 
         self.cache_manager.lock(handle)
+        transfer_started = time.perf_counter()
         try:
             self.kv_cache.copy_pages_to(
                 self.host_pool.buffer,
@@ -90,6 +94,7 @@ class HostKVTransferController:
             raise
         finally:
             self.cache_manager.unlock(handle)
+        transfer_s = time.perf_counter() - transfer_started
 
         self.entries[lifecycle_id] = HostPrefixEntry(
             lifecycle_id,
@@ -99,7 +104,7 @@ class HostKVTransferController:
         )
         evicted_tokens = self.cache_manager.evict_handle(handle)
         reclaimed_pages = len(evicted_tokens) // self.page_size
-        return OffloadResult(len(gpu_pages), reclaimed_pages, evicted)
+        return OffloadResult(len(gpu_pages), reclaimed_pages, evicted, transfer_s)
 
     def prefetch(self, lifecycle_id: str) -> PrefetchResult:
         entry = self.entries.get(lifecycle_id)
@@ -120,16 +125,19 @@ class HostKVTransferController:
             device=self.cache_manager.device,
         )
         new_handle: BaseCacheHandle | None = None
+        transfer_s = 0.0
         try:
             if missing_pages > 0:
                 allocated_starts = self.cache_manager.allocate_page_starts(missing_pages)
                 destination_pages = allocated_starts // self.page_size
                 source_slots = host_entry.slots[current_pages:]
+                transfer_started = time.perf_counter()
                 self.kv_cache.copy_pages_from(
                     self.host_pool.buffer,
                     torch.tensor(source_slots, dtype=torch.long),
                     destination_pages,
                 )
+                transfer_s = time.perf_counter() - transfer_started
                 self.host_pool.bytes_loaded += missing_pages * self.host_pool.bytes_per_page
 
             existing_indices = current.get_matched_indices()[:current_len]
@@ -156,7 +164,7 @@ class HostKVTransferController:
         if old is not None:
             self.cache_manager.unlock(old)
         self.gpu_handles[lifecycle_id] = new_handle
-        return PrefetchResult(missing_pages, new_handle.cached_len, new_handle)
+        return PrefetchResult(missing_pages, new_handle.cached_len, new_handle, transfer_s)
 
     def release(self, lifecycle_id: str, *, drop_host: bool = True) -> None:
         handle = self.gpu_handles.pop(lifecycle_id, None)

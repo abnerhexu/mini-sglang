@@ -19,6 +19,7 @@ class LifecycleRecord:
     generation_finished_at_ns: int | None = None
     tool_predicted_at_ns: int | None = None
     tool_started_at_ns: int | None = None
+    sandbox_acquired_at_ns: int | None = None
     tool_finished_at_ns: int | None = None
     continuation_submitted_at_ns: int | None = None
     generation_released_at_ns: int | None = None
@@ -163,6 +164,7 @@ class LifecycleRegistry:
         field_name = {
             "tool_predicted": "tool_predicted_at_ns",
             "tool_started": "tool_started_at_ns",
+            "sandbox_acquired": "sandbox_acquired_at_ns",
             "tool_finished": "tool_finished_at_ns",
             "continuation_submitted": "continuation_submitted_at_ns",
             "generation_released": "generation_released_at_ns",

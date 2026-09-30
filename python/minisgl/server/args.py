@@ -240,6 +240,42 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Number of pinned CPU KV pages reserved for AgentWeave offload.",
     )
     parser.add_argument(
+        "--agentweave-d2h-bandwidth-gbps",
+        type=float,
+        default=ServerArgs.agentweave_d2h_bandwidth_gbps,
+        help="Initial TokenCake GPU-to-host bandwidth estimate.",
+    )
+    parser.add_argument(
+        "--agentweave-h2d-bandwidth-gbps",
+        type=float,
+        default=ServerArgs.agentweave_h2d_bandwidth_gbps,
+        help="Initial TokenCake host-to-GPU bandwidth estimate.",
+    )
+    parser.add_argument(
+        "--agentweave-d2h-base-ms",
+        type=float,
+        default=ServerArgs.agentweave_d2h_base_ms,
+        help="Fixed GPU-to-host transfer latency estimate in milliseconds.",
+    )
+    parser.add_argument(
+        "--agentweave-h2d-base-ms",
+        type=float,
+        default=ServerArgs.agentweave_h2d_base_ms,
+        help="Fixed host-to-GPU transfer latency estimate in milliseconds.",
+    )
+    parser.add_argument(
+        "--agentweave-transfer-safety-margin-ms",
+        type=float,
+        default=ServerArgs.agentweave_transfer_safety_margin_ms,
+        help="TokenCake round-trip safety margin in milliseconds.",
+    )
+    parser.add_argument(
+        "--agentweave-transfer-calibration-alpha",
+        type=float,
+        default=ServerArgs.agentweave_transfer_calibration_alpha,
+        help="EWMA weight for observed transfer bandwidth; zero disables calibration.",
+    )
+    parser.add_argument(
         "--enable-agentweave-runtime",
         action="store_true",
         help=(
@@ -294,6 +330,25 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         parser.error("AgentWeave pool limits must be non-negative")
     if kwargs["agentweave_host_kv_pages"] < 0:
         parser.error("--agentweave-host-kv-pages must be non-negative")
+    if (
+        min(
+            kwargs["agentweave_d2h_bandwidth_gbps"],
+            kwargs["agentweave_h2d_bandwidth_gbps"],
+        )
+        <= 0
+    ):
+        parser.error("AgentWeave transfer bandwidth estimates must be positive")
+    if (
+        min(
+            kwargs["agentweave_d2h_base_ms"],
+            kwargs["agentweave_h2d_base_ms"],
+            kwargs["agentweave_transfer_safety_margin_ms"],
+        )
+        < 0
+    ):
+        parser.error("AgentWeave transfer latency estimates must be non-negative")
+    if not 0 <= kwargs["agentweave_transfer_calibration_alpha"] <= 1:
+        parser.error("--agentweave-transfer-calibration-alpha must be in [0, 1]")
     if kwargs["agentweave_pool_ttl_s"] < 0:
         parser.error("--agentweave-pool-ttl-s must be non-negative")
     if not 0 <= kwargs["agentweave_prewarm_threshold"] <= 1:

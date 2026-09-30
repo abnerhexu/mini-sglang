@@ -11,6 +11,7 @@ from minisgl.agentweave.kv import (
     KVCacheDescriptor,
     KVPressure,
     ToolKVPolicy,
+    TransferCostModel,
     create_kv_policy,
 )
 from minisgl.core import Batch, Req
@@ -77,7 +78,18 @@ class Scheduler(SchedulerIOMixin):
         )
         self.agent_lifecycles = LifecycleRegistry()
         self.agent_kv_policy_name = config.agentweave_kv_policy
-        self.agent_kv_policy: ToolKVPolicy = create_kv_policy(config.agentweave_kv_policy)
+        self.agent_transfer_cost = TransferCostModel(
+            d2h_bandwidth_gbps=config.agentweave_d2h_bandwidth_gbps,
+            h2d_bandwidth_gbps=config.agentweave_h2d_bandwidth_gbps,
+            d2h_base_s=config.agentweave_d2h_base_ms / 1000,
+            h2d_base_s=config.agentweave_h2d_base_ms / 1000,
+            safety_margin_s=config.agentweave_transfer_safety_margin_ms / 1000,
+            calibration_alpha=config.agentweave_transfer_calibration_alpha,
+        )
+        self.agent_kv_policy: ToolKVPolicy = create_kv_policy(
+            config.agentweave_kv_policy,
+            transfer=self.agent_transfer_cost,
+        )
         self.agent_cache_handles: Dict[str, BaseCacheHandle] = {}
         self.agent_cache_tokens: Dict[str, torch.Tensor] = {}
         self.agent_cache_locks: Set[str] = set()
@@ -412,10 +424,19 @@ class Scheduler(SchedulerIOMixin):
                     transfer_detail = {"transfer_error": str(exc)}
                     implemented = False
                 else:
+                    copied_bytes = result.copied_pages * self.engine.kv_cache.bytes_per_page
+                    observed_bandwidth = self.agent_transfer_cost.observe(
+                        copied_bytes,
+                        "d2h",
+                        result.transfer_s,
+                    )
                     transfer_detail = {
                         "copied_pages": result.copied_pages,
                         "reclaimed_pages": result.reclaimed_pages,
                         "evicted_host_entries": len(result.evicted_host_keys),
+                        "transfer_s": result.transfer_s,
+                        "observed_bandwidth_gbps": observed_bandwidth,
+                        "modeled_bandwidth_gbps": (self.agent_transfer_cost.d2h_bandwidth_gbps),
                     }
                     self.agent_cache_handles.pop(lifecycle_id, None)
                     self.agent_cache_tokens.pop(lifecycle_id, None)
@@ -433,9 +454,18 @@ class Scheduler(SchedulerIOMixin):
                 else:
                     self.agent_cache_handles[lifecycle_id] = result.handle
                     self.agent_cache_locks.add(lifecycle_id)
+                    restored_bytes = result.restored_pages * self.engine.kv_cache.bytes_per_page
+                    observed_bandwidth = self.agent_transfer_cost.observe(
+                        restored_bytes,
+                        "h2d",
+                        result.transfer_s,
+                    )
                     transfer_detail = {
                         "restored_pages": result.restored_pages,
                         "restored_cached_len": result.cached_len,
+                        "transfer_s": result.transfer_s,
+                        "observed_bandwidth_gbps": observed_bandwidth,
+                        "modeled_bandwidth_gbps": (self.agent_transfer_cost.h2d_bandwidth_gbps),
                     }
                     implemented = True
             else:

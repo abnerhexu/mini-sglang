@@ -86,6 +86,21 @@ def test_tokencake_rejects_unprofitable_or_capacity_limited_transfer() -> None:
     assert capacity.reason == "host_capacity"
 
 
+def test_transfer_cost_model_calibrates_bandwidth_with_ewma() -> None:
+    transfer = TransferCostModel(
+        d2h_bandwidth_gbps=3.0,
+        h2d_bandwidth_gbps=4.0,
+        d2h_base_s=0.1,
+        h2d_base_s=0.2,
+        calibration_alpha=0.5,
+    )
+    observed = transfer.observe(1_000_000_000, "d2h", 1.1)
+    assert observed == 1.0
+    assert transfer.d2h_bandwidth_gbps == 2.0
+    assert transfer.h2d_bandwidth_gbps == 4.0
+    assert transfer.observe(100, "h2d", 0.1) is None
+
+
 def test_continuum_uses_historical_quantile_and_learns_after_ttl_expiry() -> None:
     now = [5.0]
     history = ToolDurationHistory()

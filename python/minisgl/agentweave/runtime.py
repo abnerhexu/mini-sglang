@@ -223,6 +223,20 @@ class AgentRuntime:
                 definitions,
                 previous_tool=previous_tool,
             )
+            await self.event_sink.emit(
+                ToolLifecycleEvent(
+                    lifecycle_id=lifecycle_id,
+                    event="sandbox_acquired",
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    tool_name=call.name,
+                    detail={
+                        "source": acquisition.source,
+                        "predicted_tool": acquisition.predicted_tool,
+                        "correct_prediction": acquisition.correct_prediction,
+                    },
+                )
+            )
             success = False
             try:
                 result = await acquisition.sandbox.execute(call.arguments)

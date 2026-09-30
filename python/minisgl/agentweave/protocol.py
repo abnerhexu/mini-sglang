@@ -7,6 +7,7 @@ from typing import Any, Dict, Literal
 LifecycleEventName = Literal[
     "tool_predicted",
     "tool_started",
+    "sandbox_acquired",
     "tool_finished",
     "continuation_submitted",
     "generation_released",

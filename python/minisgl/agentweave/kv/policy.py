@@ -89,10 +89,15 @@ class TransferCostModel:
     d2h_base_s: float = 0.0001
     h2d_base_s: float = 0.0001
     safety_margin_s: float = 0.002
+    calibration_alpha: float = 0.2
 
     def __post_init__(self) -> None:
         if self.d2h_bandwidth_gbps <= 0 or self.h2d_bandwidth_gbps <= 0:
             raise ValueError("transfer bandwidth must be positive")
+        if min(self.d2h_base_s, self.h2d_base_s, self.safety_margin_s) < 0:
+            raise ValueError("transfer latency values must be non-negative")
+        if not 0 <= self.calibration_alpha <= 1:
+            raise ValueError("calibration_alpha must be in [0, 1]")
 
     def estimate(self, size_bytes: int, direction: Literal["d2h", "h2d"]) -> float:
         if size_bytes < 0:
@@ -107,6 +112,33 @@ class TransferCostModel:
             + self.estimate(size_bytes, "h2d")
             + self.safety_margin_s
         )
+
+    def observe(
+        self,
+        size_bytes: int,
+        direction: Literal["d2h", "h2d"],
+        elapsed_s: float,
+    ) -> float | None:
+        if size_bytes < 0 or elapsed_s < 0:
+            raise ValueError("transfer samples must be non-negative")
+        if size_bytes == 0 or self.calibration_alpha == 0:
+            return None
+        base_s = self.d2h_base_s if direction == "d2h" else self.h2d_base_s
+        payload_s = elapsed_s - base_s
+        if payload_s <= 0:
+            return None
+        observed_gbps = size_bytes / (payload_s * 1e9)
+        if direction == "d2h":
+            current = self.d2h_bandwidth_gbps
+            self.d2h_bandwidth_gbps = (
+                self.calibration_alpha * observed_gbps + (1 - self.calibration_alpha) * current
+            )
+        else:
+            current = self.h2d_bandwidth_gbps
+            self.h2d_bandwidth_gbps = (
+                self.calibration_alpha * observed_gbps + (1 - self.calibration_alpha) * current
+            )
+        return observed_gbps
 
 
 @dataclass
@@ -289,11 +321,12 @@ def create_kv_policy(
     name: str,
     *,
     clock: Callable[[], float] = time.monotonic,
+    transfer: TransferCostModel | None = None,
 ) -> ToolKVPolicy:
     if name == "no-control":
         return NoControlPolicy(clock=clock)
     if name == "tokencake":
-        return TokenCakePolicy(clock=clock)
+        return TokenCakePolicy(transfer=transfer, clock=clock)
     if name == "continuum":
         return ContinuumPolicy(clock=clock)
     raise ValueError(f"unknown AgentWeave KV policy {name!r}")

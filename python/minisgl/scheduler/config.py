@@ -19,6 +19,12 @@ class SchedulerConfig(EngineConfig):
     agentweave_event_log: str | None = None
     agentweave_kv_policy: str = "no-control"
     agentweave_host_kv_pages: int = 0
+    agentweave_d2h_bandwidth_gbps: float = 12.0
+    agentweave_h2d_bandwidth_gbps: float = 12.0
+    agentweave_d2h_base_ms: float = 0.1
+    agentweave_h2d_base_ms: float = 0.1
+    agentweave_transfer_safety_margin_ms: float = 2.0
+    agentweave_transfer_calibration_alpha: float = 0.2
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

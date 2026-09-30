@@ -76,10 +76,14 @@ def test_agent_runtime_runs_tool_and_continuation() -> None:
         assert [event.event for event in sink.events] == [
             "tool_predicted",
             "tool_started",
+            "sandbox_acquired",
             "tool_finished",
             "continuation_submitted",
             "generation_released",
         ]
+        acquired = sink.events[2]
+        assert acquired.detail["source"] == "prewarm"
+        assert acquired.detail["correct_prediction"] is True
         assert any("Tool 'lookup' returned:\n4" in message.content for message in result.messages)
         await coordinator.close()
 
