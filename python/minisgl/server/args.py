@@ -17,6 +17,11 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    enable_agentweave_runtime: bool = False
+    agentweave_pool_size: int = 8
+    agentweave_pool_per_key: int = 2
+    agentweave_pool_ttl_s: float = 60.0
+    agentweave_prewarm_threshold: float = 0.62
 
     @property
     def share_tokenizer(self) -> bool:
@@ -211,6 +216,57 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--agentweave-event-log",
+        type=str,
+        default=ServerArgs.agentweave_event_log,
+        help=(
+            "Optional JSONL event log path for AgentWeave requests. "
+            "The path may contain {rank} and {component} placeholders."
+        ),
+    )
+    parser.add_argument(
+        "--agentweave-kv-policy",
+        choices=["no-control", "tokencake", "continuum"],
+        default=ServerArgs.agentweave_kv_policy,
+        help=(
+            "Tool-aware KV policy. TokenCake decisions are available for instrumentation; "
+            "GPU/CPU transfer execution requires the host-tier integration."
+        ),
+    )
+    parser.add_argument(
+        "--enable-agentweave-runtime",
+        action="store_true",
+        help=(
+            "Enable the experimental multi-turn agent endpoint and local sandbox runtime. "
+            "The Python process backend is not a security boundary."
+        ),
+    )
+    parser.add_argument(
+        "--agentweave-pool-size",
+        type=int,
+        default=ServerArgs.agentweave_pool_size,
+        help="Maximum total number of idle sandboxes in the AgentWeave warm pool.",
+    )
+    parser.add_argument(
+        "--agentweave-pool-per-key",
+        type=int,
+        default=ServerArgs.agentweave_pool_per_key,
+        help="Maximum idle sandboxes per environment key.",
+    )
+    parser.add_argument(
+        "--agentweave-pool-ttl-s",
+        type=float,
+        default=ServerArgs.agentweave_pool_ttl_s,
+        help="Warm sandbox idle TTL in seconds.",
+    )
+    parser.add_argument(
+        "--agentweave-prewarm-threshold",
+        type=float,
+        default=ServerArgs.agentweave_prewarm_threshold,
+        help="Base confidence threshold for speculative sandbox preparation.",
+    )
+
+    parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
@@ -228,6 +284,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
+    if kwargs["agentweave_pool_size"] < 0 or kwargs["agentweave_pool_per_key"] < 0:
+        parser.error("AgentWeave pool limits must be non-negative")
+    if kwargs["agentweave_pool_ttl_s"] < 0:
+        parser.error("--agentweave-pool-ttl-s must be non-negative")
+    if not 0 <= kwargs["agentweave_prewarm_threshold"] <= 1:
+        parser.error("--agentweave-prewarm-threshold must be in [0, 1]")
     if run_shell:
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1

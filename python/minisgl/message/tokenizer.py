@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
+from minisgl.agentweave import AgentRequestMetadata, ToolLifecycleEvent
 from minisgl.core import SamplingParams
 
 from .utils import deserialize_type, serialize_type
@@ -36,6 +37,12 @@ class TokenizeMsg(BaseTokenizerMsg):
     uid: int
     text: str | List[Dict[str, str]]
     sampling_params: SamplingParams
+    agent_metadata: AgentRequestMetadata | None = None
+
+
+@dataclass
+class LifecycleControlMsg(BaseTokenizerMsg):
+    event: ToolLifecycleEvent
 
 
 @dataclass

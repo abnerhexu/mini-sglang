@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 import torch
+from minisgl.agentweave import AgentRequestMetadata, ToolLifecycleEvent
 from minisgl.core import SamplingParams
 
 from .utils import deserialize_type, serialize_type
@@ -34,6 +35,12 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
+    agent_metadata: AgentRequestMetadata | None = None
+
+
+@dataclass
+class LifecycleBackendMsg(BaseBackendMsg):
+    event: ToolLifecycleEvent
 
 
 @dataclass

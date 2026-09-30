@@ -3,13 +3,30 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from minisgl.agentweave import (
+    AgentMessage,
+    AgentRequestMetadata,
+    AgentRuntime,
+    SandboxCoordinator,
+    ToolDefinition,
+    ToolLifecycleEvent,
+)
+from minisgl.agentweave.prewarm import ConfidencePolicy, PrewarmController, ToolSchema
+from minisgl.agentweave.sandbox import (
+    PythonProcessBackend,
+    SandboxKey,
+    SandboxSpec,
+    SimulatedSandboxBackend,
+    WarmPool,
+)
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
@@ -17,6 +34,7 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    LifecycleControlMsg,
     TokenizeMsg,
     UserReply,
 )
@@ -50,15 +68,85 @@ def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
     return [msg]
 
 
+class AgentMetadataRequest(BaseModel):
+    agent_id: str
+    turn_id: int = Field(ge=0)
+    lifecycle_id: str
+    parent_lifecycle_id: str | None = None
+    is_continuation: bool = False
+    tool_name_hint: str | None = None
+
+    def to_protocol(self) -> AgentRequestMetadata:
+        return AgentRequestMetadata(**self.model_dump())
+
+
+class LifecycleEventRequest(BaseModel):
+    lifecycle_id: str
+    event: Literal[
+        "tool_predicted",
+        "tool_started",
+        "tool_finished",
+        "continuation_submitted",
+        "generation_released",
+        "abort",
+    ]
+    agent_id: str | None = None
+    turn_id: int | None = Field(default=None, ge=0)
+    tool_name: str | None = None
+    estimated_duration_s: float | None = Field(default=None, gt=0)
+    detail: Dict[str, object] = Field(default_factory=dict)
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
     ignore_eos: bool = False
+    agentweave: AgentMetadataRequest | None = None
 
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+
+
+class AgentToolRequest(BaseModel):
+    name: str = Field(min_length=1)
+    required_keys: List[str] = Field(default_factory=list)
+    sandbox_backend: Literal["python-process", "simulated"] = "python-process"
+    runtime: str = "default"
+    dependencies: List[str] = Field(default_factory=list)
+    preparation_level: str = "runtime"
+    environment: Dict[str, str] = Field(default_factory=dict)
+
+    def to_definition(self) -> ToolDefinition:
+        key = SandboxKey(
+            backend=self.sandbox_backend,
+            runtime=self.runtime,
+            dependencies=tuple(sorted(self.dependencies)),
+            preparation_level=self.preparation_level,
+        )
+        return ToolDefinition(
+            schema=ToolSchema(
+                name=self.name,
+                required_keys=tuple(self.required_keys),
+                sandbox_type=self.sandbox_backend,
+                preparation_level=self.preparation_level,
+            ),
+            sandbox=SandboxSpec(
+                key=key,
+                environment=tuple(sorted(self.environment.items())),
+            ),
+        )
+
+
+class AgentRunRequest(BaseModel):
+    model: str
+    agent_id: str = Field(min_length=1)
+    run_id: str | None = None
+    messages: List[Message] = Field(min_length=1)
+    tools: List[AgentToolRequest] = Field(min_length=1)
+    max_steps: int = Field(default=8, ge=1, le=64)
+    max_tokens: int = Field(default=1024, ge=1)
 
 
 class OpenAICompletionRequest(BaseModel):
@@ -81,6 +169,7 @@ class OpenAICompletionRequest(BaseModel):
     frequency_penalty: float = 0.0
 
     ignore_eos: bool = False
+    agentweave: AgentMetadataRequest | None = None
 
 
 class ModelCard(BaseModel):
@@ -96,6 +185,47 @@ class ModelList(BaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class MiniSGLStreamingGenerator:
+    def __init__(self, state: FrontendManager) -> None:
+        self.state = state
+
+    async def generate(
+        self,
+        messages: Sequence[AgentMessage],
+        tools: Sequence[ToolDefinition],
+        metadata: AgentRequestMetadata,
+        *,
+        max_tokens: int,
+    ) -> AsyncIterator[str]:
+        _ = tools  # Tool declarations are rendered into the system prompt by AgentRuntime.
+        uid = self.state.new_user()
+        await self.state.send_one(
+            TokenizeMsg(
+                uid=uid,
+                text=[{"role": message.role, "content": message.content} for message in messages],
+                sampling_params=SamplingParams(max_tokens=max_tokens),
+                agent_metadata=metadata,
+            )
+        )
+        try:
+            async for ack in self.state.wait_for_ack(uid):
+                if ack.incremental_output:
+                    yield ack.incremental_output
+                if ack.finished:
+                    break
+        finally:
+            if uid in self.state.ack_map:
+                await self.state.abort_user(uid)
+
+
+class FrontendLifecycleSink:
+    def __init__(self, state: FrontendManager) -> None:
+        self.state = state
+
+    async def emit(self, event: ToolLifecycleEvent) -> None:
+        await self.state.send_one(LifecycleControlMsg(event=event))
+
+
 @dataclass
 class FrontendManager:
     config: ServerArgs
@@ -105,6 +235,25 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    sandbox_coordinator: SandboxCoordinator | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if not self.config.enable_agentweave_runtime:
+            return
+        self.sandbox_coordinator = SandboxCoordinator(
+            {
+                "python-process": PythonProcessBackend(),
+                "simulated": SimulatedSandboxBackend(),
+            },
+            WarmPool(
+                max_total=self.config.agentweave_pool_size,
+                max_per_key=self.config.agentweave_pool_per_key,
+                ttl_s=self.config.agentweave_pool_ttl_s,
+            ),
+            PrewarmController(
+                ConfidencePolicy(base_threshold=self.config.agentweave_prewarm_threshold)
+            ),
+        )
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -208,6 +357,10 @@ class FrontendManager:
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
 
+    async def close_agentweave(self) -> None:
+        if self.sandbox_coordinator is not None:
+            await self.sandbox_coordinator.close()
+
     def shutdown(self):
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
@@ -219,6 +372,7 @@ async def lifespan(_: FastAPI):
     # shutdown code here
     global _GLOBAL_STATE
     if _GLOBAL_STATE is not None:
+        await _GLOBAL_STATE.close_agentweave()
         _GLOBAL_STATE.shutdown()
 
 
@@ -238,6 +392,7 @@ async def generate(req: GenerateRequest, request: Request):
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
             ),
+            agent_metadata=(req.agentweave.to_protocol() if req.agentweave else None),
         )
     )
 
@@ -250,6 +405,58 @@ async def generate(req: GenerateRequest, request: Request):
 @app.api_route("/v1", methods=["GET", "POST", "HEAD", "OPTIONS"])
 async def v1_root():
     return {"status": "ok"}
+
+
+@app.post("/v1/agentweave/events", status_code=202)
+async def agentweave_event(req: LifecycleEventRequest):
+    state = get_global_state()
+    event = ToolLifecycleEvent(**req.model_dump())
+    await state.send_one(LifecycleControlMsg(event=event))
+    return {
+        "status": "accepted",
+        "lifecycle_id": event.lifecycle_id,
+        "event": event.event,
+    }
+
+
+@app.post("/v1/agent/runs")
+async def agent_run(req: AgentRunRequest):
+    state = get_global_state()
+    coordinator = state.sandbox_coordinator
+    if coordinator is None:
+        raise HTTPException(
+            status_code=403,
+            detail="AgentWeave runtime is disabled; launch with --enable-agentweave-runtime",
+        )
+    tools = tuple(tool.to_definition() for tool in req.tools)
+    names = [tool.schema.name for tool in tools]
+    if len(names) != len(set(names)):
+        raise HTTPException(status_code=422, detail="Tool names must be unique")
+
+    runtime = AgentRuntime(
+        MiniSGLStreamingGenerator(state),
+        coordinator,
+        FrontendLifecycleSink(state),
+    )
+    result = await runtime.run(
+        [AgentMessage(message.role, message.content) for message in req.messages],
+        tools,
+        agent_id=req.agent_id,
+        run_id=req.run_id,
+        max_steps=req.max_steps,
+        max_tokens=req.max_tokens,
+    )
+    return {
+        "id": result.run_id,
+        "object": "agent.run",
+        "status": result.status,
+        "content": result.content,
+        "steps": result.steps,
+        "tool_calls": result.tool_calls,
+        "messages": [
+            {"role": message.role, "content": message.content} for message in result.messages
+        ],
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -274,6 +481,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
+            agent_metadata=(req.agentweave.to_protocol() if req.agentweave else None),
         )
     )
 
@@ -334,6 +542,7 @@ async def shell_completion(req: OpenAICompletionRequest):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
+            agent_metadata=(req.agentweave.to_protocol() if req.agentweave else None),
         )
     )
 
@@ -345,7 +554,6 @@ async def shell_completion(req: OpenAICompletionRequest):
         media_type="text/event-stream",
         background=BackgroundTask(lambda: _abort),
     )
-
 
 
 async def shell():
@@ -399,6 +607,7 @@ async def shell():
     finally:
         print("Exiting shell...")
         await asyncio.sleep(0.1)
+        await get_global_state().close_agentweave()
         get_global_state().shutdown()
         # then kill all the subprocesses
         import psutil

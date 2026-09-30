@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 if TYPE_CHECKING:
+    from minisgl.agentweave import AgentRequestMetadata
     from minisgl.core import SamplingParams
 
     from .prefill import ChunkedReq
@@ -16,6 +17,7 @@ class PendingReq:
     uid: int
     input_ids: torch.Tensor
     sampling_params: SamplingParams
+    agent_metadata: AgentRequestMetadata | None = None
     chunked_req: ChunkedReq | None = None
 
     @property

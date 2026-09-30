@@ -36,6 +36,36 @@ class BaseKVCachePool(ABC):
     @abstractmethod
     def num_layers(self) -> int: ...
 
+    @property
+    @abstractmethod
+    def num_pages(self) -> int: ...
+
+    @property
+    @abstractmethod
+    def bytes_per_page(self) -> int: ...
+
+    @abstractmethod
+    def copy_pages_to(
+        self,
+        destination: torch.Tensor,
+        source_pages: torch.Tensor,
+        destination_pages: torch.Tensor,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy complete KV pages into a compatible tensor."""
+
+    @abstractmethod
+    def copy_pages_from(
+        self,
+        source: torch.Tensor,
+        source_pages: torch.Tensor,
+        destination_pages: torch.Tensor,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        """Restore complete KV pages from a compatible tensor."""
+
 
 @dataclass(frozen=True)
 class BaseCacheHandle(ABC):
@@ -119,6 +149,14 @@ class BasePrefixCache(ABC):
             torch.Tensor: The indices evicted. Shape: (evict_size,)
         Raises:
             RuntimeError: If the requested size is larger than the evictable size.
+        """
+
+    @abstractmethod
+    def evict_handle(self, handle: BaseCacheHandle) -> torch.Tensor:
+        """Evict the unreferenced leaf suffix reachable from ``handle``.
+
+        Implementations must not evict shared or locked nodes. The returned
+        token indices can be returned to the page allocator.
         """
 
     @abstractmethod

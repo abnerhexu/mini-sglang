@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Literal
 import torch
 
 if TYPE_CHECKING:
+    from minisgl.agentweave import AgentRequestMetadata
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
@@ -34,6 +35,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    agent_metadata: AgentRequestMetadata | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

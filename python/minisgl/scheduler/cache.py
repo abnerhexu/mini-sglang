@@ -27,7 +27,10 @@ class CacheManager:
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        return self.prefix_cache.match_prefix(req.input_ids[: input_len - 1])
+        return self.match_prefix(req.input_ids[: input_len - 1])
+
+    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
+        return self.prefix_cache.match_prefix(input_ids)
 
     @property
     def available_size(self) -> int:
@@ -52,7 +55,7 @@ class CacheManager:
             allocated = self._page_to_token(self._allocate(needed_pages))
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
-    def cache_req(self, req: Req, *, finished: bool) -> None:
+    def cache_req(self, req: Req, *, finished: bool) -> BaseCacheHandle:
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
@@ -77,6 +80,13 @@ class CacheManager:
         else:  # keep the tail part, update the handle
             req.cache_handle = new_handle
             self.lock(new_handle)
+        return new_handle
+
+    def evict_handle(self, handle: BaseCacheHandle) -> torch.Tensor:
+        evicted = self.prefix_cache.evict_handle(handle)
+        if len(evicted) > 0:
+            self._free(evicted)
+        return evicted
 
     def check_integrity(self) -> None:
         self.prefix_cache.check_integrity()

@@ -34,6 +34,10 @@ class NaivePrefixCache(BasePrefixCache):
             return self.empty_tensor
         raise NotImplementedError("NaiveCacheManager does not support eviction.")
 
+    def evict_handle(self, handle: BaseCacheHandle) -> torch.Tensor:
+        _ = handle
+        return self.empty_tensor
+
     def reset(self) -> None:
         pass
 

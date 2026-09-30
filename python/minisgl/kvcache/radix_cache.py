@@ -174,6 +174,24 @@ class RadixPrefixCache(BasePrefixCache):
 
         return torch.cat(evicted_indices)
 
+    def evict_handle(self, handle: BaseCacheHandle) -> torch.Tensor:
+        if not isinstance(handle, RadixCacheHandle):
+            raise TypeError("RadixPrefixCache requires a RadixCacheHandle")
+        node = handle.node
+        evicted_indices: List[torch.Tensor] = []
+        while not node.is_root() and node.is_leaf() and node.ref_count == 0:
+            parent = node.parent
+            key = self.key_fn(node._key)
+            if parent.children.get(key) is not node:
+                break  # stale handle whose node has already been detached
+            del parent.children[key]
+            self.evictable_size -= node.length
+            evicted_indices.append(node.value)
+            node = parent
+        if not evicted_indices:
+            return self.empty_tensor
+        return torch.cat(evicted_indices[::-1])
+
     def reset(self) -> None:
         raise NotImplementedError("RadixManager.reset is not implemented")
 
