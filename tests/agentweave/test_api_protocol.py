@@ -34,6 +34,7 @@ def test_agent_tool_request_conversion() -> None:
     assert definition.schema.required_keys == ("code",)
     assert definition.sandbox.key.backend == "python-process"
     assert definition.sandbox.key.dependencies == ("numpy",)
+    assert definition.sandbox.key.environment == (("MODE", "test"),)
     assert definition.sandbox.environment == (("MODE", "test"),)
 
 

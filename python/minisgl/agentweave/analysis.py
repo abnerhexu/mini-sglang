@@ -52,6 +52,7 @@ def summarize_events(
     sandbox_sources: Counter[str] = Counter()
     predictions: Counter[str] = Counter()
     kv_actions: Counter[str] = Counter()
+    continuation_restore: Counter[str] = Counter()
     transfer_totals = {
         "d2h_pages": 0,
         "h2d_pages": 0,
@@ -75,7 +76,10 @@ def summarize_events(
             predictions["correct" if prediction_correct else "incorrect"] += 1
 
         for event in events:
-            if event.get("event") != "kv_policy_decision":
+            event_name = event.get("event")
+            if isinstance(event_name, str) and event_name.startswith("continuation_restore_"):
+                continuation_restore[event_name.removeprefix("continuation_restore_")] += 1
+            if event_name != "kv_policy_decision":
                 continue
             action = event.get("action")
             if isinstance(action, str):
@@ -102,6 +106,7 @@ def summarize_events(
             ),
         },
         "kv_actions": dict(sorted(kv_actions.items())),
+        "continuation_restore": dict(sorted(continuation_restore.items())),
         "transfers": transfer_totals,
     }
     if include_lifecycles:

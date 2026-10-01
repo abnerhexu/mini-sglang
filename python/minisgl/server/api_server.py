@@ -120,11 +120,13 @@ class AgentToolRequest(BaseModel):
     environment: Dict[str, str] = Field(default_factory=dict)
 
     def to_definition(self) -> ToolDefinition:
+        environment = tuple(sorted(self.environment.items()))
         key = SandboxKey(
             backend=self.sandbox_backend,
             runtime=self.runtime,
             dependencies=tuple(sorted(self.dependencies)),
             preparation_level=self.preparation_level,
+            environment=environment,
         )
         return ToolDefinition(
             schema=ToolSchema(
@@ -133,10 +135,7 @@ class AgentToolRequest(BaseModel):
                 sandbox_type=self.sandbox_backend,
                 preparation_level=self.preparation_level,
             ),
-            sandbox=SandboxSpec(
-                key=key,
-                environment=tuple(sorted(self.environment.items())),
-            ),
+            sandbox=SandboxSpec(key=key, environment=environment),
         )
 
 

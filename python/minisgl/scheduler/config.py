@@ -25,6 +25,7 @@ class SchedulerConfig(EngineConfig):
     agentweave_h2d_base_ms: float = 0.1
     agentweave_transfer_safety_margin_ms: float = 2.0
     agentweave_transfer_calibration_alpha: float = 0.2
+    agentweave_continuation_restore_timeout_s: float = 5.0
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

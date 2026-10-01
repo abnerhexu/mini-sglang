@@ -35,6 +35,27 @@ def test_warm_pool_reuses_and_expires_sandboxes() -> None:
     asyncio.run(scenario())
 
 
+def test_simulated_sandbox_accepts_per_tool_delay_configuration() -> None:
+    async def scenario() -> None:
+        backend = SimulatedSandboxBackend()
+        environment = (
+            ("AGENTWEAVE_SIMULATED_PREPARE_DELAY_S", "0"),
+            ("AGENTWEAVE_SIMULATED_EXECUTION_DELAY_S", "0.01"),
+        )
+        sandbox = await backend.prepare(
+            SandboxSpec(
+                SandboxKey("simulated", environment=environment),
+                environment=environment,
+            )
+        )
+        result = await sandbox.execute({"result": 1})
+        assert result.output == 1
+        assert result.duration_s >= 0.009
+        await sandbox.close()
+
+    asyncio.run(scenario())
+
+
 def test_coordinator_prewarms_and_recycles_wrong_prediction() -> None:
     async def scenario() -> None:
         backend = SimulatedSandboxBackend(preparation_delay_s=0.01)

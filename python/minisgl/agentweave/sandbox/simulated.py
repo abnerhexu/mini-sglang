@@ -50,6 +50,30 @@ class SimulatedSandboxBackend(SandboxBackend):
         self.prepare_count = 0
 
     async def prepare(self, spec: SandboxSpec) -> PreparedSandbox:
-        await asyncio.sleep(self.preparation_delay_s)
+        environment = dict(spec.environment)
+        preparation_delay_s = _delay_from_environment(
+            environment,
+            "AGENTWEAVE_SIMULATED_PREPARE_DELAY_S",
+            self.preparation_delay_s,
+        )
+        execution_delay_s = _delay_from_environment(
+            environment,
+            "AGENTWEAVE_SIMULATED_EXECUTION_DELAY_S",
+            self.execution_delay_s,
+        )
+        await asyncio.sleep(preparation_delay_s)
         self.prepare_count += 1
-        return SimulatedSandbox(spec.key, self.execution_delay_s)
+        return SimulatedSandbox(spec.key, execution_delay_s)
+
+
+def _delay_from_environment(environment: Mapping[str, str], key: str, default: float) -> float:
+    raw = environment.get(key)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a floating-point number") from exc
+    if value < 0:
+        raise ValueError(f"{key} must be non-negative")
+    return value

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -55,6 +57,13 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+@dataclass(frozen=True)
+class DeferredContinuation:
+    parent_lifecycle_id: str
+    msg: UserMsg
+    deadline: float
+
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
@@ -84,7 +93,9 @@ class Scheduler(SchedulerIOMixin):
             d2h_base_s=config.agentweave_d2h_base_ms / 1000,
             h2d_base_s=config.agentweave_h2d_base_ms / 1000,
             safety_margin_s=config.agentweave_transfer_safety_margin_ms / 1000,
-            calibration_alpha=config.agentweave_transfer_calibration_alpha,
+            calibration_alpha=(
+                config.agentweave_transfer_calibration_alpha if config.tp_info.size == 1 else 0.0
+            ),
         )
         self.agent_kv_policy: ToolKVPolicy = create_kv_policy(
             config.agentweave_kv_policy,
@@ -94,6 +105,9 @@ class Scheduler(SchedulerIOMixin):
         self.agent_cache_tokens: Dict[str, torch.Tensor] = {}
         self.agent_cache_locks: Set[str] = set()
         self.agent_kv_started: Set[str] = set()
+        self.agent_deferred_continuations: Dict[str, DeferredContinuation] = {}
+        self.agent_continuation_restore_timeout_s = config.agentweave_continuation_restore_timeout_s
+        self.agent_clock = time.monotonic
         self.agent_host_pool: HostKVPagePool | None = None
         self.agent_kv_transfer: HostKVTransferController | None = None
         if config.agentweave_host_kv_pages > 0:
@@ -185,7 +199,11 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
-        lifecycle_ids = set(self.agent_cache_handles) | set(self.agent_cache_tokens)
+        lifecycle_ids = (
+            set(self.agent_cache_handles)
+            | set(self.agent_cache_tokens)
+            | set(self.agent_deferred_continuations)
+        )
         if self.agent_kv_transfer is not None:
             lifecycle_ids.update(self.agent_kv_transfer.entries)
         for lifecycle_id in lifecycle_ids:
@@ -255,36 +273,7 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
-            logger.debug_rank0("Received user msg: %s", msg)
-            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
-            if max_output_len <= 0:
-                return logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
-                )
-            if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
-                logger.warning_rank0(
-                    f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
-                )
-            if msg.agent_metadata is not None:
-                metadata = msg.agent_metadata
-                if metadata.is_continuation and metadata.parent_lifecycle_id is not None:
-                    self._prepare_agent_continuation(metadata.parent_lifecycle_id)
-                record, created = self.agent_lifecycles.request_received(
-                    msg.uid, msg.agent_metadata
-                )
-                self.agent_events.emit(
-                    "request_received",
-                    lifecycle_id=record.lifecycle_id,
-                    agent_id=record.agent_id,
-                    turn_id=record.turn_id,
-                    uid=msg.uid,
-                    duplicate=not created,
-                    parent_lifecycle_id=record.parent_lifecycle_id,
-                )
-            self.prefill_manager.add_one_req(msg)
+            self._process_user_msg(msg)
         elif isinstance(msg, LifecycleBackendMsg):
             record, created = self.agent_lifecycles.apply(msg.event)
             self.agent_events.emit(
@@ -301,7 +290,10 @@ class Scheduler(SchedulerIOMixin):
             if created and msg.event.event == "tool_started":
                 self._start_agent_kv_policy(record.lifecycle_id)
             elif created and msg.event.event == "tool_finished":
-                action = self.agent_kv_policy.on_tool_finished(record.lifecycle_id)
+                action = self.agent_kv_policy.on_tool_finished(
+                    record.lifecycle_id,
+                    actual_duration_s=self._agent_tool_duration_s(record.lifecycle_id),
+                )
                 self._apply_agent_kv_action(action)
             elif created and msg.event.event == "abort":
                 action = self.agent_kv_policy.on_abort(record.lifecycle_id)
@@ -312,6 +304,14 @@ class Scheduler(SchedulerIOMixin):
                 self._release_agent_kv_resources(record.lifecycle_id)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
+            for parent, deferred in tuple(self.agent_deferred_continuations.items()):
+                if deferred.msg.uid == msg.uid:
+                    del self.agent_deferred_continuations[parent]
+                    self._release_agent_kv_resources(parent)
+                    self._emit_continuation_restore_event(
+                        "continuation_restore_aborted", parent, deferred.msg
+                    )
+                    break
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
@@ -334,6 +334,86 @@ class Scheduler(SchedulerIOMixin):
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
+
+    def _process_user_msg(self, msg: UserMsg) -> None:
+        logger.debug_rank0("Received user msg: %s", msg)
+        input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+        max_output_len = max_seq_len - input_len
+        if max_output_len <= 0:
+            logger.warning_rank0(
+                f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                f"request {msg.uid} is dropped."
+            )
+            return
+        if msg.sampling_params.max_tokens > max_output_len:
+            msg.sampling_params.max_tokens = max_output_len
+            logger.warning_rank0(f"Adjust max_tokens to {max_output_len} for request {msg.uid}.")
+
+        metadata = msg.agent_metadata
+        if metadata is not None:
+            record, created = self.agent_lifecycles.request_received(msg.uid, metadata)
+            self.agent_events.emit(
+                "request_received",
+                lifecycle_id=record.lifecycle_id,
+                agent_id=record.agent_id,
+                turn_id=record.turn_id,
+                uid=msg.uid,
+                duplicate=not created,
+                parent_lifecycle_id=record.parent_lifecycle_id,
+            )
+            parent = metadata.parent_lifecycle_id
+            if metadata.is_continuation and parent is not None:
+                if not self._prepare_agent_continuation(parent):
+                    if self.agent_continuation_restore_timeout_s <= 0:
+                        self._release_agent_kv_resources(parent)
+                        self._emit_continuation_restore_event(
+                            "continuation_restore_fallback", parent, msg
+                        )
+                    else:
+                        existing = self.agent_deferred_continuations.get(parent)
+                        if existing is not None and existing.msg.uid != msg.uid:
+                            raise RuntimeError(f"multiple continuations for lifecycle {parent!r}")
+                        self.agent_deferred_continuations[parent] = DeferredContinuation(
+                            parent,
+                            msg,
+                            self.agent_clock() + self.agent_continuation_restore_timeout_s,
+                        )
+                        self._emit_continuation_restore_event(
+                            "continuation_restore_deferred", parent, msg
+                        )
+                        return
+        self.prefill_manager.add_one_req(msg)
+
+    def _retry_deferred_continuations(self) -> None:
+        now = self.agent_clock()
+        scheduler_busy = self.prefill_manager.runnable or self.decode_manager.runnable
+        for parent, deferred in tuple(self.agent_deferred_continuations.items()):
+            if self._prepare_agent_continuation(parent):
+                del self.agent_deferred_continuations[parent]
+                self.prefill_manager.add_one_req(deferred.msg)
+                self._emit_continuation_restore_event(
+                    "continuation_restore_ready", parent, deferred.msg
+                )
+            elif now >= deferred.deadline or not scheduler_busy:
+                del self.agent_deferred_continuations[parent]
+                self._release_agent_kv_resources(parent)
+                self.prefill_manager.add_one_req(deferred.msg)
+                self._emit_continuation_restore_event(
+                    "continuation_restore_fallback", parent, deferred.msg
+                )
+
+    def _emit_continuation_restore_event(
+        self, event: str, parent_lifecycle_id: str, msg: UserMsg
+    ) -> None:
+        metadata = msg.agent_metadata
+        self.agent_events.emit(
+            event,
+            lifecycle_id=metadata.lifecycle_id if metadata is not None else None,
+            agent_id=metadata.agent_id if metadata is not None else None,
+            turn_id=metadata.turn_id if metadata is not None else None,
+            uid=msg.uid,
+            parent_lifecycle_id=parent_lifecycle_id,
+        )
 
     def _free_req_resources(self, req: Req) -> BaseCacheHandle:
         self.table_manager.free(req.table_idx)
@@ -402,6 +482,7 @@ class Scheduler(SchedulerIOMixin):
     def _process_kv_policy_tick(self) -> None:
         for action in self.agent_kv_policy.on_tick():
             self._apply_agent_kv_action(action)
+        self._retry_deferred_continuations()
 
     def _apply_agent_kv_action(self, action: KVAction) -> None:
         lifecycle_id = action.lifecycle_id
@@ -486,8 +567,11 @@ class Scheduler(SchedulerIOMixin):
             **transfer_detail,
         )
 
-    def _prepare_agent_continuation(self, lifecycle_id: str) -> None:
-        completion_action = self.agent_kv_policy.on_tool_finished(lifecycle_id)
+    def _prepare_agent_continuation(self, lifecycle_id: str) -> bool:
+        completion_action = self.agent_kv_policy.on_tool_finished(
+            lifecycle_id,
+            actual_duration_s=self._agent_tool_duration_s(lifecycle_id),
+        )
         if completion_action.action != "none":
             self._apply_agent_kv_action(completion_action)
         transfer = self.agent_kv_transfer
@@ -497,8 +581,18 @@ class Scheduler(SchedulerIOMixin):
                     KVAction("prefetch", lifecycle_id, "continuation_demand_restore")
                 )
             if lifecycle_id not in transfer.gpu_handles:
-                return
+                return False
         self._release_agent_kv_resources(lifecycle_id)
+        return True
+
+    def _agent_tool_duration_s(self, lifecycle_id: str) -> float | None:
+        record = self.agent_lifecycles.records.get(lifecycle_id)
+        if record is None or record.tool_started_at_ns is None:
+            return None
+        end_ns = record.tool_finished_at_ns or record.continuation_submitted_at_ns
+        if end_ns is None or end_ns < record.tool_started_at_ns:
+            return None
+        return (end_ns - record.tool_started_at_ns) / 1e9
 
     def _release_agent_kv_resources(self, lifecycle_id: str) -> None:
         tier_locked = (

@@ -276,6 +276,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="EWMA weight for observed transfer bandwidth; zero disables calibration.",
     )
     parser.add_argument(
+        "--agentweave-continuation-restore-timeout-s",
+        type=float,
+        default=ServerArgs.agentweave_continuation_restore_timeout_s,
+        help=(
+            "Maximum time to defer a continuation while restoring host KV before "
+            "falling back to normal prefix recomputation."
+        ),
+    )
+    parser.add_argument(
         "--enable-agentweave-runtime",
         action="store_true",
         help=(
@@ -349,6 +358,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         parser.error("AgentWeave transfer latency estimates must be non-negative")
     if not 0 <= kwargs["agentweave_transfer_calibration_alpha"] <= 1:
         parser.error("--agentweave-transfer-calibration-alpha must be in [0, 1]")
+    if kwargs["agentweave_continuation_restore_timeout_s"] < 0:
+        parser.error("--agentweave-continuation-restore-timeout-s must be non-negative")
     if kwargs["agentweave_pool_ttl_s"] < 0:
         parser.error("--agentweave-pool-ttl-s must be non-negative")
     if not 0 <= kwargs["agentweave_prewarm_threshold"] <= 1:

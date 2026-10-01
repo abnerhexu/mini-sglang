@@ -32,6 +32,8 @@ def test_event_summary_reports_latency_sandbox_and_transfer_metrics() -> None:
         ),
         _event("life-1", "tool_finished", 50_000_000),
         _event("life-1", "continuation_submitted", 52_000_000),
+        _event("life-1", "continuation_restore_deferred", 52_100_000),
+        _event("life-1", "continuation_restore_ready", 52_200_000),
         _event(
             "life-1",
             "kv_policy_decision",
@@ -78,6 +80,7 @@ def test_event_summary_reports_latency_sandbox_and_transfer_metrics() -> None:
         "accuracy": 1.0,
     }
     assert summary["kv_actions"] == {"offload": 1, "prefetch": 1}
+    assert summary["continuation_restore"] == {"deferred": 1, "ready": 1}
     assert summary["transfers"] == {
         "d2h_pages": 2,
         "h2d_pages": 2,

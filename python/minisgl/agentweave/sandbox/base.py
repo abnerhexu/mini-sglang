@@ -11,12 +11,17 @@ class SandboxKey:
     runtime: str = "default"
     dependencies: tuple[str, ...] = ()
     preparation_level: str = "runtime"
+    environment: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
 class SandboxSpec:
     key: SandboxKey
     environment: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.key.environment != self.environment:
+            raise ValueError("sandbox key and specification environments must match")
 
 
 @dataclass(frozen=True)

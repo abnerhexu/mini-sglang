@@ -18,7 +18,7 @@ from minisgl.agentweave.kv import (
     TransferCostModel,
 )
 from minisgl.kvcache import BaseCacheHandle, MatchResult
-from minisgl.scheduler.scheduler import Scheduler
+from minisgl.scheduler.scheduler import DeferredContinuation, Scheduler
 
 
 class FakeHandle(BaseCacheHandle):
@@ -48,6 +48,28 @@ class FakeTransfer:
         self.entries.pop(lifecycle_id, None)
         self.gpu_handles.pop(lifecycle_id, None)
         self.released.append(lifecycle_id)
+
+
+class FailingTransfer(FakeTransfer):
+    def __init__(self, prefetched_handle: FakeHandle, failures: int) -> None:
+        super().__init__(prefetched_handle)
+        self.failures = failures
+
+    def prefetch(self, lifecycle_id) -> PrefetchResult:
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("GPU pages unavailable")
+        return super().prefetch(lifecycle_id)
+
+
+class FakePrefillManager:
+    def __init__(self) -> None:
+        self.pending_list = []
+        self.admitted = []
+        self.runnable = True
+
+    def add_one_req(self, msg) -> None:
+        self.admitted.append(msg)
 
 
 class FakeCacheManager:
@@ -81,11 +103,15 @@ def _scheduler(policy, policy_name: str, handle: FakeHandle) -> Scheduler:
     scheduler.agent_cache_tokens = {}
     scheduler.agent_cache_locks = set()
     scheduler.agent_kv_started = set()
+    scheduler.agent_deferred_continuations = {}
+    scheduler.agent_continuation_restore_timeout_s = 5.0
+    scheduler.agent_clock = lambda: 0.0
     scheduler.agent_host_pool = None
     scheduler.agent_kv_transfer = None
     scheduler.agent_events = EventLogger(None, component="scheduler")
     scheduler.cache_manager = FakeCacheManager(handle)
-    scheduler.prefill_manager = SimpleNamespace(pending_list=[])
+    scheduler.prefill_manager = FakePrefillManager()
+    scheduler.decode_manager = SimpleNamespace(runnable=False)
     scheduler.engine = SimpleNamespace(kv_cache=SimpleNamespace(bytes_per_page=128))
     return scheduler
 
@@ -164,6 +190,42 @@ def test_scheduler_demand_restores_before_continuation_then_releases_lease() -> 
     assert "life-1" not in transfer.entries
     assert "life-1" not in scheduler.agent_cache_locks
     assert scheduler.agent_cache_handles == {}
+
+
+def test_scheduler_retries_deferred_continuation_restore() -> None:
+    source_handle = FakeHandle(cached_len=4)
+    restored_handle = FakeHandle(cached_len=4)
+    scheduler = _scheduler(NoControlPolicy(), "tokencake", source_handle)
+    transfer = FailingTransfer(restored_handle, failures=1)
+    transfer.entries["life-1"] = object()
+    scheduler.agent_kv_transfer = transfer
+    msg = SimpleNamespace(uid=2, agent_metadata=None)
+    scheduler.agent_deferred_continuations["life-1"] = DeferredContinuation("life-1", msg, 5.0)
+
+    scheduler._process_kv_policy_tick()
+    assert "life-1" in scheduler.agent_deferred_continuations
+    assert scheduler.prefill_manager.admitted == []
+
+    scheduler._process_kv_policy_tick()
+    assert scheduler.agent_deferred_continuations == {}
+    assert scheduler.prefill_manager.admitted == [msg]
+    assert transfer.released == ["life-1"]
+
+
+def test_scheduler_deferred_continuation_falls_back_after_timeout() -> None:
+    source_handle = FakeHandle(cached_len=4)
+    scheduler = _scheduler(NoControlPolicy(), "tokencake", source_handle)
+    transfer = FailingTransfer(source_handle, failures=10)
+    transfer.entries["life-1"] = object()
+    scheduler.agent_kv_transfer = transfer
+    scheduler.agent_clock = lambda: 6.0
+    msg = SimpleNamespace(uid=2, agent_metadata=None)
+    scheduler.agent_deferred_continuations["life-1"] = DeferredContinuation("life-1", msg, 5.0)
+
+    scheduler._process_kv_policy_tick()
+    assert scheduler.agent_deferred_continuations == {}
+    assert scheduler.prefill_manager.admitted == [msg]
+    assert transfer.released == ["life-1"]
 
 
 def test_scheduler_no_control_does_not_retain_request_tokens() -> None:
