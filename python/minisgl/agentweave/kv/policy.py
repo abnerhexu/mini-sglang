@@ -175,6 +175,10 @@ class ToolKVPolicy(ABC):
         _ = now
         return []
 
+    def on_continuation(self, lifecycle_id: str) -> bool:
+        """Consume a policy-specific priority hint at continuation admission."""
+        return False
+
     def on_tool_finished(
         self, lifecycle_id: str, *, actual_duration_s: float | None = None
     ) -> KVAction:
@@ -231,6 +235,9 @@ class TokenCakePolicy(ToolKVPolicy):
         self.transfer = transfer or TransferCostModel()
         self.min_gpu_usage = min_gpu_usage
         self.prefetch_lead_factor = prefetch_lead_factor
+        # Duration learning must include windows where offload was declined;
+        # otherwise an unknown tool can never acquire its first estimate.
+        self._tool_windows: Dict[str, tuple[KVCacheDescriptor, float]] = {}
 
     def on_tool_started(
         self,
@@ -244,6 +251,7 @@ class TokenCakePolicy(ToolKVPolicy):
         h2d = self.transfer.estimate(descriptor.size_bytes, "h2d")
         needed = d2h + h2d + self.transfer.safety_margin_s
         lifecycle_id = descriptor.lifecycle_id
+        self._tool_windows.setdefault(lifecycle_id, (descriptor, self.clock()))
         if descriptor.num_pages <= 0:
             return KVAction("none", lifecycle_id, "empty_cache", estimated_duration_s=duration)
         if pressure.host_free_pages < descriptor.num_pages:
@@ -302,19 +310,26 @@ class TokenCakePolicy(ToolKVPolicy):
         self, lifecycle_id: str, *, actual_duration_s: float | None = None
     ) -> KVAction:
         state = self.states.pop(lifecycle_id, None)
+        window = self._tool_windows.pop(lifecycle_id, None)
+        if window is not None:
+            descriptor, started_at = window
+            duration = (
+                actual_duration_s
+                if actual_duration_s is not None
+                else max(0.0, self.clock() - started_at)
+            )
+            self.history.observe(descriptor.tool_name, duration)
         if state is None:
             return KVAction("none", lifecycle_id, "not_offloaded")
-        duration = (
-            actual_duration_s
-            if actual_duration_s is not None
-            else max(0.0, self.clock() - state.started_at)
-        )
-        self.history.observe(state.descriptor.tool_name, duration)
         return KVAction(
             "none" if state.prefetched else "prefetch",
             lifecycle_id,
             "already_prefetched" if state.prefetched else "tool_returned_early",
         )
+
+    def on_abort(self, lifecycle_id: str) -> KVAction:
+        self._tool_windows.pop(lifecycle_id, None)
+        return super().on_abort(lifecycle_id)
 
 
 def create_kv_policy(
@@ -350,6 +365,7 @@ class ContinuumPolicy(ToolKVPolicy):
         self.default_ttl_s = default_ttl_s
         self.min_ttl_s = min_ttl_s
         self.max_ttl_s = max_ttl_s
+        self.continuation_deadlines: Dict[str, float] = {}
 
     def on_tool_started(
         self,
@@ -394,6 +410,9 @@ class ContinuumPolicy(ToolKVPolicy):
 
     def on_tick(self, now: float | None = None) -> list[KVAction]:
         now = self.clock() if now is None else now
+        for lifecycle_id, deadline in tuple(self.continuation_deadlines.items()):
+            if now >= deadline:
+                del self.continuation_deadlines[lifecycle_id]
         actions = []
         for lifecycle_id, state in self.states.items():
             if not state.released and state.deadline is not None and now >= state.deadline:
@@ -413,8 +432,20 @@ class ContinuumPolicy(ToolKVPolicy):
             else max(0.0, self.clock() - state.started_at)
         )
         self.history.observe(state.descriptor.tool_name, duration)
+        # tool_finished normally precedes request tokenization. Preserve the
+        # original TTL until admission even though the GPU lease is released now.
+        if not state.released and state.deadline is not None and self.clock() < state.deadline:
+            self.continuation_deadlines[lifecycle_id] = state.deadline
         return KVAction(
             "none" if state.released else "release",
             lifecycle_id,
             "ttl_already_expired" if state.released else "continuation_arrived",
         )
+
+    def on_continuation(self, lifecycle_id: str) -> bool:
+        deadline = self.continuation_deadlines.pop(lifecycle_id, None)
+        return deadline is not None and self.clock() < deadline
+
+    def on_abort(self, lifecycle_id: str) -> KVAction:
+        self.continuation_deadlines.pop(lifecycle_id, None)
+        return super().on_abort(lifecycle_id)

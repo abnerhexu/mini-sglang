@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import time
+import weakref
 from dataclasses import dataclass
 from typing import Dict, Literal
 
-from .prewarm import PrewarmController, PrewarmDecision, ResourcePressure, ToolSchema
-from .sandbox import PreparedSandbox, SandboxBackend, SandboxSpec, WarmPool
+from .prewarm import (
+    PrewarmController,
+    PrewarmDecision,
+    ResourceMonitor,
+    ResourcePressure,
+    ToolSchema,
+)
+from .sandbox import PreparedSandbox, SandboxBackend, SandboxKey, SandboxSpec, WarmPool
 
 
 @dataclass(frozen=True)
@@ -35,6 +43,9 @@ class SandboxCoordinator:
         backends: Dict[str, SandboxBackend],
         warm_pool: WarmPool,
         prewarm: PrewarmController | None = None,
+        *,
+        resource_monitor: ResourceMonitor | None = None,
+        cold_start_prior_ms: float = 100.0,
     ) -> None:
         self.backends = backends
         self.warm_pool = warm_pool
@@ -42,6 +53,16 @@ class SandboxCoordinator:
         self._tasks: Dict[str, asyncio.Task[PreparedSandbox]] = {}
         self._predicted_tools: Dict[str, str] = {}
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self.resource_monitor = resource_monitor or ResourceMonitor()
+        self.cold_start_prior_ms = cold_start_prior_ms
+        self.cold_start_estimates: Dict[SandboxKey, float] = {}
+        self.cold_start_samples: Dict[SandboxKey, int] = {}
+        self._sandboxes: weakref.WeakSet[PreparedSandbox] = weakref.WeakSet()
+        self._preparing = 0
+
+    @property
+    def live_sandboxes(self) -> int:
+        return self._preparing + sum(not sandbox.closed for sandbox in self._sandboxes)
 
     def observe_delta(
         self,
@@ -51,10 +72,22 @@ class SandboxCoordinator:
         *,
         previous_tool: str | None = None,
         token_probability: float | None = None,
-        pressure: ResourcePressure = ResourcePressure(),
-        cold_start_ms: float = 100.0,
+        pressure: ResourcePressure | None = None,
+        cold_start_ms: float | None = None,
     ) -> PrewarmDecision:
         schemas = tuple(tool.schema for tool in tools)
+        if pressure is None:
+            pressure = self.resource_monitor.sample(
+                live_sandboxes=self.live_sandboxes,
+                pool_size=self.warm_pool.size,
+                pool_capacity=self.warm_pool.max_total,
+            )
+        costs = {
+            tool.schema.name: self.cold_start_estimates.get(
+                tool.sandbox.key, self.cold_start_prior_ms
+            )
+            for tool in tools
+        }
         decision = self.prewarm.feed(
             lifecycle_id,
             delta,
@@ -62,7 +95,7 @@ class SandboxCoordinator:
             previous_tool=previous_tool,
             token_probability=token_probability,
             pressure=pressure,
-            cold_start_ms=cold_start_ms,
+            cold_start_ms=costs if cold_start_ms is None else cold_start_ms,
         )
         if decision.should_prewarm and lifecycle_id not in self._tasks:
             assert decision.tool_name is not None
@@ -107,7 +140,7 @@ class SandboxCoordinator:
         pooled = await self.warm_pool.acquire(definition.sandbox.key)
         if pooled is not None:
             return SandboxAcquisition(pooled, actual_tool, predicted, False, "pool")
-        sandbox = await self._backend(definition.sandbox).prepare(definition.sandbox)
+        sandbox = await self._cold_prepare(definition.sandbox)
         return SandboxAcquisition(sandbox, actual_tool, predicted, False, "cold")
 
     async def recycle(self, acquisition: SandboxAcquisition) -> bool:
@@ -166,7 +199,21 @@ class SandboxCoordinator:
         pooled = await self.warm_pool.acquire(spec.key)
         if pooled is not None:
             return pooled
-        return await self._backend(spec).prepare(spec)
+        return await self._cold_prepare(spec)
+
+    async def _cold_prepare(self, spec: SandboxSpec) -> PreparedSandbox:
+        self._preparing += 1
+        started = time.monotonic()
+        try:
+            sandbox = await self._backend(spec).prepare(spec)
+        finally:
+            self._preparing -= 1
+        elapsed_ms = (time.monotonic() - started) * 1000
+        previous = self.cold_start_estimates.get(spec.key, elapsed_ms)
+        self.cold_start_estimates[spec.key] = 0.3 * elapsed_ms + 0.7 * previous
+        self.cold_start_samples[spec.key] = self.cold_start_samples.get(spec.key, 0) + 1
+        self._sandboxes.add(sandbox)
+        return sandbox
 
     def _backend(self, spec: SandboxSpec) -> SandboxBackend:
         try:

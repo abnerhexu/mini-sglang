@@ -382,7 +382,24 @@ class Scheduler(SchedulerIOMixin):
                             "continuation_restore_deferred", parent, msg
                         )
                         return
-        self.prefill_manager.add_one_req(msg)
+        self._admit_agent_request(msg)
+
+    def _admit_agent_request(self, msg: UserMsg) -> None:
+        metadata = msg.agent_metadata
+        priority = False
+        if metadata is not None and metadata.is_continuation and metadata.parent_lifecycle_id:
+            priority = self.agent_kv_policy.on_continuation(metadata.parent_lifecycle_id)
+            self.agent_events.emit(
+                "continuation_priority",
+                lifecycle_id=metadata.lifecycle_id,
+                parent_lifecycle_id=metadata.parent_lifecycle_id,
+                agent_id=metadata.agent_id,
+                turn_id=metadata.turn_id,
+                uid=msg.uid,
+                policy=self.agent_kv_policy_name,
+                priority=priority,
+            )
+        self.prefill_manager.add_one_req(msg, priority=priority)
 
     def _retry_deferred_continuations(self) -> None:
         now = self.agent_clock()
@@ -390,14 +407,14 @@ class Scheduler(SchedulerIOMixin):
         for parent, deferred in tuple(self.agent_deferred_continuations.items()):
             if self._prepare_agent_continuation(parent):
                 del self.agent_deferred_continuations[parent]
-                self.prefill_manager.add_one_req(deferred.msg)
+                self._admit_agent_request(deferred.msg)
                 self._emit_continuation_restore_event(
                     "continuation_restore_ready", parent, deferred.msg
                 )
             elif now >= deferred.deadline or not scheduler_busy:
                 del self.agent_deferred_continuations[parent]
                 self._release_agent_kv_resources(parent)
-                self.prefill_manager.add_one_req(deferred.msg)
+                self._admit_agent_request(deferred.msg)
                 self._emit_continuation_restore_event(
                     "continuation_restore_fallback", parent, deferred.msg
                 )

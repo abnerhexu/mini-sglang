@@ -19,6 +19,7 @@ class PendingReq:
     sampling_params: SamplingParams
     agent_metadata: AgentRequestMetadata | None = None
     chunked_req: ChunkedReq | None = None
+    priority: bool = False
 
     @property
     def input_len(self) -> int:

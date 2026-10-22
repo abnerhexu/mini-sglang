@@ -29,6 +29,7 @@ def _python_worker(connection: Connection, workdir: str, environment: dict[str, 
             if operation == "close":
                 return
             if operation == "reset":
+                os.chdir(workdir)
                 namespace = {"__name__": "__agentweave_sandbox__"}
                 os.environ.clear()
                 os.environ.update(clean_environment)
@@ -99,6 +100,10 @@ class PythonProcessSandbox(PreparedSandbox):
         self._closed = False
 
     @property
+    def closed(self) -> bool:
+        return self._closed or not self._process.is_alive()
+
+    @property
     def key(self) -> SandboxKey:
         return self._key
 
@@ -165,7 +170,7 @@ class PythonProcessSandbox(PreparedSandbox):
 
             try:
                 return await asyncio.to_thread(round_trip)
-            except TimeoutError:
+            except (TimeoutError, asyncio.CancelledError):
                 self._process.terminate()
                 await asyncio.to_thread(self._process.join, 1.0)
                 self._connection.close()
@@ -202,7 +207,7 @@ class PythonProcessBackend(SandboxBackend):
 
         try:
             await asyncio.to_thread(wait_until_ready)
-        except Exception:
+        except BaseException:
             if process.is_alive():
                 process.terminate()
                 await asyncio.to_thread(process.join, 1.0)

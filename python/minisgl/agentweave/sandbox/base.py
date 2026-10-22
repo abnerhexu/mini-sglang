@@ -35,6 +35,10 @@ class ExecutionResult:
 class PreparedSandbox(ABC):
     @property
     @abstractmethod
+    def closed(self) -> bool: ...
+
+    @property
+    @abstractmethod
     def key(self) -> SandboxKey: ...
 
     @abstractmethod

@@ -86,6 +86,22 @@ def test_tokencake_rejects_unprofitable_or_capacity_limited_transfer() -> None:
     assert capacity.reason == "host_capacity"
 
 
+def test_tokencake_learns_first_duration_without_a_client_estimate() -> None:
+    policy = TokenCakePolicy(clock=lambda: 0.0)
+    first = policy.on_tool_started(_descriptor(), _pressure())
+    assert first.reason == "transfer_not_amortized"
+    assert policy.on_tick(1.0) == []
+    assert policy.on_tool_finished("life-1", actual_duration_s=1.0).action == "none"
+    # Repeated continuation/finish notifications must not add a second sample.
+    policy.on_tool_finished("life-1", actual_duration_s=9.0)
+    assert policy.history.ewma("python") == 1.0
+    second = policy.on_tool_started(_descriptor("life-2"), _pressure())
+    assert second.action == "offload"
+    assert second.estimated_duration_s == 1.0
+    policy.on_abort("life-2")
+    assert not policy._tool_windows
+
+
 def test_transfer_cost_model_calibrates_bandwidth_with_ewma() -> None:
     transfer = TransferCostModel(
         d2h_bandwidth_gbps=3.0,

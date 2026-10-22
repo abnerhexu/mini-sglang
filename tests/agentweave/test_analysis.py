@@ -103,3 +103,16 @@ def test_analysis_cli_reads_jsonl_and_writes_summary(tmp_path) -> None:
     assert load_jsonl([log_path]) == records
     output = json.loads(output_path.read_text())
     assert output["durations"]["ttft_ms"]["mean"] == 1.0
+
+
+def test_continuation_first_token_is_joined_to_parent_lifecycle() -> None:
+    summary = summarize_events(
+        [
+            _event("parent", "tool_finished", 10_000_000),
+            _event("child", "request_received", 11_000_000, parent_lifecycle_id="parent"),
+            _event("child", "generation_first_token", 18_000_000),
+        ],
+        include_lifecycles=True,
+    )
+    assert summary["durations"]["tool_return_to_first_token_ms"]["mean"] == 8.0
+    assert summary["lifecycles"]["parent"]["tool_return_to_first_token_ms"] == 8.0

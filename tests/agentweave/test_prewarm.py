@@ -45,7 +45,7 @@ def test_resource_pressure_raises_adaptive_threshold() -> None:
     pressured = policy.decide(
         evidence,
         schema,
-        pressure=ResourcePressure(process_usage=1.0),
+        pressure=ResourcePressure(process_usage=0.8),
     )
     assert normal.should_prewarm
     assert not pressured.should_prewarm
@@ -77,3 +77,16 @@ def test_controller_learns_actual_transition_and_clears_state() -> None:
     assert selected == "python"
     assert "life-1" not in controller.states
     assert controller.history.probability("bash", "python") is not None
+
+
+def test_prewarm_ablations_disable_or_keep_a_fixed_threshold() -> None:
+    schemas = (ToolSchema("python", required_keys=("code",)),)
+    evidence = StreamingToolCallParser().feed('{"name":"python","arguments":{', schemas)
+    pressure = ResourcePressure(process_usage=1.0)
+    disabled = ConfidencePolicy(mode="disabled").decide(evidence, schemas)
+    fixed = ConfidencePolicy(mode="fixed").decide(evidence, schemas, pressure=pressure)
+    adaptive = ConfidencePolicy().decide(evidence, schemas, pressure=pressure)
+    assert not disabled.should_prewarm
+    assert fixed.should_prewarm
+    assert fixed.threshold == 0.62
+    assert not adaptive.should_prewarm

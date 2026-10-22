@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import DefaultDict
+from typing import DefaultDict, Literal, Mapping
 
 from .parser import ToolCallEvidence, ToolSchema
 
@@ -26,6 +26,8 @@ class PrewarmDecision:
     expected_value_ms: float
     should_prewarm: bool
     reason: str
+    resource_pressure: ResourcePressure = ResourcePressure()
+    cold_start_ms: float = 100.0
 
 
 class ToolTransitionHistory:
@@ -50,12 +52,14 @@ class ConfidencePolicy:
         base_threshold: float = 0.62,
         max_pressure_penalty: float = 0.25,
         wrong_prediction_cost_ms: float = 10.0,
+        mode: Literal["disabled", "fixed", "confidence"] = "confidence",
     ) -> None:
         if not 0 <= base_threshold <= 1:
             raise ValueError("base_threshold must be in [0, 1]")
         self.base_threshold = base_threshold
         self.max_pressure_penalty = max_pressure_penalty
         self.wrong_prediction_cost_ms = wrong_prediction_cost_ms
+        self.mode = mode
 
     def decide(
         self,
@@ -66,17 +70,34 @@ class ConfidencePolicy:
         transition_history: ToolTransitionHistory | None = None,
         token_probability: float | None = None,
         pressure: ResourcePressure = ResourcePressure(),
-        cold_start_ms: float = 100.0,
+        cold_start_ms: float | Mapping[str, float] = 100.0,
     ) -> PrewarmDecision:
+        if self.mode == "disabled":
+            return PrewarmDecision(
+                None, 0.0, self.base_threshold, 0.0, False, "disabled", resource_pressure=pressure
+            )
         schema_map = {schema.name: schema for schema in schemas}
         candidate = self._select_candidate(evidence, schemas, previous_tool, transition_history)
+        cost_ms = (
+            cold_start_ms.get(candidate, 100.0)
+            if isinstance(cold_start_ms, Mapping)
+            else cold_start_ms
+        )
         threshold = min(
             0.95,
-            self.base_threshold + pressure.normalized * self.max_pressure_penalty,
+            self.base_threshold
+            + (pressure.normalized * self.max_pressure_penalty if self.mode == "confidence" else 0),
         )
         if candidate is None:
             return PrewarmDecision(
-                None, 0.0, threshold, -self.wrong_prediction_cost_ms, False, "ambiguous"
+                None,
+                0.0,
+                threshold,
+                -self.wrong_prediction_cost_ms,
+                False,
+                "ambiguous",
+                pressure,
+                cost_ms,
             )
 
         confidence = 0.0
@@ -103,20 +124,25 @@ class ConfidencePolicy:
 
         confidence = min(1.0, confidence)
         expected_value = (
-            confidence * cold_start_ms
+            confidence * cost_ms
             - (1 - confidence) * self.wrong_prediction_cost_ms
             - pressure.normalized * self.wrong_prediction_cost_ms
         )
-        should_prewarm = confidence >= threshold and expected_value > 0
-        reason = (
-            "selected"
-            if should_prewarm
-            else (
-                "resource_pressure"
-                if confidence >= self.base_threshold and threshold > confidence
-                else "low_confidence"
-            )
+        should_prewarm = confidence >= threshold and (self.mode == "fixed" or expected_value > 0)
+        capacity_exhausted = self.mode == "confidence" and (
+            pressure.process_usage >= 1.0 or pressure.memory_usage >= 0.95
         )
+        should_prewarm = should_prewarm and not capacity_exhausted
+        if should_prewarm:
+            reason = "selected"
+        elif capacity_exhausted:
+            reason = "resource_capacity"
+        elif confidence >= self.base_threshold and threshold > confidence:
+            reason = "resource_pressure"
+        elif confidence >= threshold and expected_value <= 0:
+            reason = "negative_benefit"
+        else:
+            reason = "low_confidence"
         return PrewarmDecision(
             candidate,
             confidence,
@@ -124,6 +150,8 @@ class ConfidencePolicy:
             expected_value,
             should_prewarm,
             reason,
+            pressure,
+            cost_ms,
         )
 
     @staticmethod

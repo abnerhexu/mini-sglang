@@ -22,6 +22,9 @@ class ServerArgs(SchedulerConfig):
     agentweave_pool_per_key: int = 2
     agentweave_pool_ttl_s: float = 60.0
     agentweave_prewarm_threshold: float = 0.62
+    agentweave_prewarm_mode: str = "confidence"
+    agentweave_max_sandboxes: int = 32
+    agentweave_cold_start_prior_ms: float = 100.0
 
     @property
     def share_tokenizer(self) -> bool:
@@ -311,10 +314,28 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Warm sandbox idle TTL in seconds.",
     )
     parser.add_argument(
+        "--agentweave-prewarm-mode",
+        choices=["disabled", "fixed", "confidence"],
+        default=ServerArgs.agentweave_prewarm_mode,
+        help="Prewarming ablation: disabled, fixed threshold, or confidence/benefit aware.",
+    )
+    parser.add_argument(
         "--agentweave-prewarm-threshold",
         type=float,
         default=ServerArgs.agentweave_prewarm_threshold,
         help="Base confidence threshold for speculative sandbox preparation.",
+    )
+    parser.add_argument(
+        "--agentweave-max-sandboxes",
+        type=int,
+        default=ServerArgs.agentweave_max_sandboxes,
+        help="Live sandbox budget used to suppress speculative preparation under pressure.",
+    )
+    parser.add_argument(
+        "--agentweave-cold-start-prior-ms",
+        type=float,
+        default=ServerArgs.agentweave_cold_start_prior_ms,
+        help="Cold-start estimate before the first measured preparation of an environment.",
     )
 
     parser.add_argument(
@@ -337,6 +358,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     run_shell |= kwargs.pop("shell_mode")
     if kwargs["agentweave_pool_size"] < 0 or kwargs["agentweave_pool_per_key"] < 0:
         parser.error("AgentWeave pool limits must be non-negative")
+    if kwargs["agentweave_max_sandboxes"] <= 0:
+        parser.error("--agentweave-max-sandboxes must be positive")
+    if kwargs["agentweave_cold_start_prior_ms"] < 0:
+        parser.error("--agentweave-cold-start-prior-ms must be non-negative")
     if kwargs["agentweave_host_kv_pages"] < 0:
         parser.error("--agentweave-host-kv-pages must be non-negative")
     if (

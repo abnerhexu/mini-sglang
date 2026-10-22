@@ -12,6 +12,7 @@ from .parser import (
     ToolSchema,
     parse_complete_tool_call,
 )
+from .resources import ResourceMonitor
 
 __all__ = [
     "ConfidencePolicy",
@@ -20,6 +21,7 @@ __all__ = [
     "PrewarmController",
     "PrewarmDecision",
     "ResourcePressure",
+    "ResourceMonitor",
     "StreamingToolCallParser",
     "ToolCallEvidence",
     "ToolSchema",

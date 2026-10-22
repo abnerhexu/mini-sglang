@@ -47,3 +47,12 @@ def test_run_agent_workload_records_success_and_http_failure(monkeypatch) -> Non
     assert results[1]["success"] is False
     assert results[1]["http_status"] == 503
     assert results[1]["error"].startswith("HTTP 503")
+
+
+def test_max_steps_is_not_a_successful_benchmark_run(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "_post_json", lambda *args: (200, {"status": "max_steps"}))
+    results = agent.run_workload(
+        "http://server", [agent.WorkloadItem(0, _request())], concurrency=1, timeout_s=1
+    )
+    assert results[0]["success"] is False
+    assert "max_steps" in results[0]["error"]

@@ -121,10 +121,24 @@ class PrefillManager:
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
 
-    def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, req.agent_metadata)
+    def add_one_req(self, req: UserMsg, *, priority: bool = False) -> None:
+        pending = PendingReq(
+            req.uid, req.input_ids, req.sampling_params, req.agent_metadata, priority=priority
         )
+        if priority:
+            # Keep FIFO order within each priority group and let an already
+            # admitted chunked prefill finish before starting a new request.
+            index = next(
+                (
+                    i
+                    for i, other in enumerate(self.pending_list)
+                    if not other.priority and other.chunked_req is None
+                ),
+                len(self.pending_list),
+            )
+            self.pending_list.insert(index, pending)
+        else:
+            self.pending_list.append(pending)
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

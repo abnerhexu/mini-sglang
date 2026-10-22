@@ -68,7 +68,7 @@ class FakePrefillManager:
         self.admitted = []
         self.runnable = True
 
-    def add_one_req(self, msg) -> None:
+    def add_one_req(self, msg, *, priority=False) -> None:
         self.admitted.append(msg)
 
 
@@ -238,3 +238,44 @@ def test_scheduler_no_control_does_not_retain_request_tokens() -> None:
     scheduler._register_agent_cache(request, handle)
     assert scheduler.agent_cache_tokens == {}
     assert scheduler.cache_manager.locked == []
+
+
+def test_continuum_prioritizes_only_continuations_admitted_within_ttl() -> None:
+    from minisgl.agentweave.kv import KVCacheDescriptor, KVPressure
+    from minisgl.core import SamplingParams
+    from minisgl.scheduler.prefill import PrefillManager
+
+    now = [0.0]
+    policy = ContinuumPolicy(clock=lambda: now[0])
+    scheduler = _scheduler(policy, "continuum", FakeHandle(cached_len=4))
+    scheduler.prefill_manager = PrefillManager(None, None, None)
+
+    def request(uid, parent=None):
+        metadata = AgentRequestMetadata(
+            "agent",
+            1,
+            f"child-{uid}",
+            parent_lifecycle_id=parent,
+            is_continuation=parent is not None,
+        )
+        return SimpleNamespace(
+            uid=uid,
+            input_ids=torch.tensor([1]),
+            sampling_params=SamplingParams(),
+            agent_metadata=metadata,
+        )
+
+    for name in ("early", "late"):
+        policy.on_tool_started(
+            KVCacheDescriptor(name, "agent", "python", 4, 128), KVPressure(0, 100, 0, 0)
+        )
+    now[0] = 0.5
+    policy.on_tool_finished("early")
+    policy.on_tool_finished("late")
+    scheduler._admit_agent_request(request(1))
+    scheduler._admit_agent_request(request(2, "early"))
+    now[0] = 3.0
+    scheduler._admit_agent_request(request(3, "late"))
+    assert [req.uid for req in scheduler.prefill_manager.pending_list] == [2, 1, 3]
+    assert [req.priority for req in scheduler.prefill_manager.pending_list] == [True, False, False]
+    assert not policy.continuation_deadlines

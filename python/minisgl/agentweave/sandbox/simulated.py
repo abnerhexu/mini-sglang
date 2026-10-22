@@ -11,8 +11,12 @@ class SimulatedSandbox(PreparedSandbox):
     def __init__(self, key: SandboxKey, execution_delay_s: float) -> None:
         self._key = key
         self.execution_delay_s = execution_delay_s
-        self.closed = False
+        self._closed = False
         self.reset_count = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     @property
     def key(self) -> SandboxKey:
@@ -40,7 +44,7 @@ class SimulatedSandbox(PreparedSandbox):
         self.reset_count += 1
 
     async def close(self) -> None:
-        self.closed = True
+        self._closed = True
 
 
 class SimulatedSandboxBackend(SandboxBackend):

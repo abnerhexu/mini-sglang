@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal, Protocol
 
 from .coordinator import SandboxCoordinator, ToolDefinition
@@ -68,7 +68,8 @@ class AgentRuntime:
         max_steps: int = 8,
         max_tokens: int = 1024,
         previous_tool: str | None = None,
-        pressure: ResourcePressure = ResourcePressure(),
+        pressure: ResourcePressure | None = None,
+        tool_timeout_s: float | None = 30.0,
     ) -> AgentRunResult:
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
@@ -112,6 +113,7 @@ class AgentRuntime:
             )
             chunks: list[str] = []
             prediction_emitted = False
+            decision = None
             try:
                 async for delta in self.generator.generate(
                     conversation,
@@ -140,6 +142,8 @@ class AgentRuntime:
                                     "confidence": decision.confidence,
                                     "threshold": decision.threshold,
                                     "expected_value_ms": decision.expected_value_ms,
+                                    "resource_pressure": asdict(decision.resource_pressure),
+                                    "cold_start_ms": decision.cold_start_ms,
                                 },
                             )
                         )
@@ -234,12 +238,13 @@ class AgentRuntime:
                         "source": acquisition.source,
                         "predicted_tool": acquisition.predicted_tool,
                         "correct_prediction": acquisition.correct_prediction,
+                        "last_prewarm_decision": asdict(decision) if decision else None,
                     },
                 )
             )
             success = False
             try:
-                result = await acquisition.sandbox.execute(call.arguments)
+                result = await acquisition.sandbox.execute(call.arguments, timeout_s=tool_timeout_s)
                 success = True
                 result_text = _format_tool_result(result.output, result.stdout, result.stderr)
             except Exception as exc:

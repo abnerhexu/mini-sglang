@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Mapping
 
 from .confidence import (
     ConfidencePolicy,
@@ -41,7 +41,7 @@ class PrewarmController:
         previous_tool: str | None = None,
         token_probability: float | None = None,
         pressure: ResourcePressure = ResourcePressure(),
-        cold_start_ms: float = 100.0,
+        cold_start_ms: float | Mapping[str, float] = 100.0,
     ) -> PrewarmDecision:
         state = self.states.setdefault(lifecycle_id, PredictionState())
         evidence = state.parser.feed(delta, schemas)

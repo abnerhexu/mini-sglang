@@ -19,7 +19,12 @@ from minisgl.agentweave import (
     ToolDefinition,
     ToolLifecycleEvent,
 )
-from minisgl.agentweave.prewarm import ConfidencePolicy, PrewarmController, ToolSchema
+from minisgl.agentweave.prewarm import (
+    ConfidencePolicy,
+    PrewarmController,
+    ResourceMonitor,
+    ToolSchema,
+)
 from minisgl.agentweave.sandbox import (
     PythonProcessBackend,
     SandboxKey,
@@ -147,6 +152,7 @@ class AgentRunRequest(BaseModel):
     tools: List[AgentToolRequest] = Field(min_length=1)
     max_steps: int = Field(default=8, ge=1, le=64)
     max_tokens: int = Field(default=1024, ge=1)
+    tool_timeout_s: float = Field(default=30.0, gt=0)
 
 
 class OpenAICompletionRequest(BaseModel):
@@ -251,8 +257,13 @@ class FrontendManager:
                 ttl_s=self.config.agentweave_pool_ttl_s,
             ),
             PrewarmController(
-                ConfidencePolicy(base_threshold=self.config.agentweave_prewarm_threshold)
+                ConfidencePolicy(
+                    base_threshold=self.config.agentweave_prewarm_threshold,
+                    mode=self.config.agentweave_prewarm_mode,
+                )
             ),
+            resource_monitor=ResourceMonitor(max_sandboxes=self.config.agentweave_max_sandboxes),
+            cold_start_prior_ms=self.config.agentweave_cold_start_prior_ms,
         )
 
     def new_user(self) -> int:
@@ -445,6 +456,7 @@ async def agent_run(req: AgentRunRequest):
         run_id=req.run_id,
         max_steps=req.max_steps,
         max_tokens=req.max_tokens,
+        tool_timeout_s=req.tool_timeout_s,
     )
     return {
         "id": result.run_id,

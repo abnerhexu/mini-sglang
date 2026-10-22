@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from minisgl.agentweave.prewarm import parse_complete_tool_call
+
 
 @dataclass(frozen=True)
 class WorkloadItem:
@@ -93,7 +95,10 @@ def _execute_one(
         and status_code is not None
         and 200 <= status_code < 300
         and response is not None
+        and response.get("status") == "completed"
     )
+    if error is None and response is not None and response.get("status") != "completed":
+        error = f"Agent ended with status {response.get('status')!r}"
     return {
         "index": item.index,
         "agent_id": item.request.get("agent_id"),
@@ -104,6 +109,17 @@ def _execute_one(
         "agent_status": response.get("status") if response else None,
         "steps": response.get("steps") if response else None,
         "tool_calls": response.get("tool_calls") if response else None,
+        "tool_call_names": [
+            call.name
+            for message in (response.get("messages", []) if response else [])
+            if message.get("role") == "assistant"
+            and (call := parse_complete_tool_call(message.get("content", ""))) is not None
+        ],
+        "tool_results": [
+            message["content"].split("returned:\n", 1)[1]
+            for message in (response.get("messages", []) if response else [])
+            if message.get("role") == "user" and "returned:\n" in message.get("content", "")
+        ],
         "latency_ms": (finished_ns - started_ns) / 1_000_000,
         "wall_started_ns": wall_started_ns,
         "error": error,

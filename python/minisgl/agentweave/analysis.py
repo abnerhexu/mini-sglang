@@ -15,6 +15,7 @@ _DURATION_PAIRS = {
     "tool_execution_ms": ("sandbox_acquired", "tool_finished"),
     "tool_window_ms": ("tool_started", "tool_finished"),
     "continuation_gap_ms": ("tool_finished", "continuation_submitted"),
+    "tool_return_to_first_token_ms": ("tool_finished", "continuation_first_token"),
 }
 
 
@@ -40,12 +41,18 @@ def summarize_events(
 ) -> dict[str, Any]:
     by_lifecycle: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     ignored = 0
+    tool_failures = 0
     for record in records:
         lifecycle_id = record.get("lifecycle_id")
         if not isinstance(lifecycle_id, str) or not lifecycle_id:
             ignored += 1
             continue
         by_lifecycle[lifecycle_id].append(record)
+        if (
+            record.get("event") == "tool_finished"
+            and record.get("detail", {}).get("success") is False
+        ):
+            tool_failures += 1
 
     lifecycle_metrics: dict[str, dict[str, Any]] = {}
     durations: dict[str, list[float]] = defaultdict(list)
@@ -61,7 +68,37 @@ def summarize_events(
         "failed_actions": 0,
     }
 
+    # The continuation's first token belongs to a new lifecycle. Join through
+    # the explicit parent identity rather than relying on agent/turn ordering.
+    continuation_tokens: dict[str, int] = {}
+    for events in list(by_lifecycle.values()):
+        parent = next(
+            (
+                event.get("parent_lifecycle_id")
+                for event in events
+                if event.get("event") == "request_received"
+            ),
+            None,
+        )
+        first_tokens = [
+            event["timestamp_ns"]
+            for event in events
+            if event.get("event") == "generation_first_token"
+            and isinstance(event.get("timestamp_ns"), int)
+        ]
+        if isinstance(parent, str) and first_tokens:
+            first = min(first_tokens)
+            continuation_tokens[parent] = min(continuation_tokens.get(parent, first), first)
+
     for lifecycle_id, events in by_lifecycle.items():
+        if lifecycle_id in continuation_tokens:
+            events = [
+                *events,
+                {
+                    "event": "continuation_first_token",
+                    "timestamp_ns": continuation_tokens[lifecycle_id],
+                },
+            ]
         metrics = _summarize_lifecycle(events)
         lifecycle_metrics[lifecycle_id] = metrics
         for name in _DURATION_PAIRS:
@@ -96,6 +133,7 @@ def summarize_events(
     result: dict[str, Any] = {
         "num_lifecycles": len(by_lifecycle),
         "ignored_records": ignored,
+        "tool_failures": tool_failures,
         "durations": {name: _distribution(durations[name]) for name in _DURATION_PAIRS},
         "sandbox_sources": dict(sorted(sandbox_sources.items())),
         "predictions": {
